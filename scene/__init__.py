@@ -20,11 +20,12 @@ from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from torch.utils.data import Dataset
 from scene.dataset_readers import add_points
+import numpy as np
 class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_coarse=False):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_coarse=False, init_random_pcd = False):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -91,6 +92,8 @@ class Scene:
                                                     "iteration_" + str(self.loaded_iter),
                                                    ))
         else:
+            if init_random_pcd:
+                scene_info.point_cloud.points = np.random.randn(scene_info.point_cloud.points.shape[0],scene_info.point_cloud.points.shape[1]) * scene_info.point_cloud.points.std() + scene_info.point_cloud.points.mean()
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, self.maxtime)
 
     def save(self, iteration, stage):

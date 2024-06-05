@@ -24,12 +24,15 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
 import lpips
 from utils.scene_utils import render_training_image
 from time import time
 import copy
+
+import wandb
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
@@ -40,7 +43,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter,timer):
+                         gaussians, scene, stage, tb_writer, using_wandb, train_iter,timer):
     first_iter = 0
 
     gaussians.training_setup(opt)
@@ -240,20 +243,21 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # Log and save
             timer.pause()
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
+            training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
             if dataset.render_process:
-                if (iteration < 1000 and iteration % 10 == 9) \
-                    or (iteration < 3000 and iteration % 50 == 49) \
-                        or (iteration < 60000 and iteration %  100 == 99) :
-                    # breakpoint()
-                        render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                        render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                        # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                if (iteration < 1000 and iteration % 50 == 1) \
+                    or (iteration < 3000 and iteration % 100 == 99) \
+                        or (iteration < 60000 and iteration %  500 == 499) \
+                            or (iteration < 200000 and iteration %  1000 == 999) :
+                            # breakpoint()
+                            render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
 
-                    # total_images.append(to8b(temp_image).transpose(1,2,0))
+                        # total_images.append(to8b(temp_image).transpose(1,2,0))
             timer.start()
             # Densification
             if iteration < opt.densify_until_iter :
@@ -294,7 +298,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
-def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
+def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, using_wandb):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
@@ -304,10 +308,10 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer.start()
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer)
+                             gaussians, scene, "coarse", tb_writer, using_wandb, opt.coarse_iterations, timer)
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, "fine", tb_writer, opt.iterations,timer)
+                         gaussians, scene, "fine", tb_writer, using_wandb, opt.iterations,timer)
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:
@@ -332,11 +336,13 @@ def prepare_output_and_logger(expname):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
+def training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
     if tb_writer:
         tb_writer.add_scalar(f'{stage}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{stage}/train_loss_patchestotal_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{stage}/iter_time', elapsed, iteration)
+    if using_wandb:
+        wandb.log({f'{stage}/train_loss_patches/l1_loss': Ll1.item(), f'{stage}/train_loss_patches/total_loss': loss.item(), f'{stage}/iter_time' : elapsed})
         
     
     # Report test and samples of training set
@@ -361,6 +367,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(stage + "/"+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                             if iteration == testing_iterations[0]:
                                 tb_writer.add_images(stage + "/"+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        if using_wandb and (idx < 5):
+                            rendered_img = transforms.functional.to_pil_image(image[None], mode=None)
+                            wandb.log({f"{stage}/{config['name']}_view_{viewpoint.image_name}/render": wandb.Image(rendered_img)})
+                            if iteration == testing_iterations[0]:
+                                gt_img = transforms.functional.to_pil_image(gt_image[None], mode=None)
+                                wandb.log({f"{stage}/{config['name']}_view_{viewpoint.image_name}/ground_truth": wandb.Image(gt_img)})
                     except:
                         pass
                     l1_test += l1_loss(image, gt_image).mean().double()
@@ -374,13 +386,21 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(stage + "/"+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(stage+"/"+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                if using_wandb:
+                    wandb.log({f"{stage}/{config['name']}/loss_viewpoint - l1_loss": l1_test})
+                    wandb.log({f"{stage}/{config['name']}/loss_viewpoint - psnr": psnr_test})
+
 
         if tb_writer:
             tb_writer.add_histogram(f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            
             tb_writer.add_scalar(f'{stage}/total_points', scene.gaussians.get_xyz.shape[0], iteration)
             tb_writer.add_scalar(f'{stage}/deformation_rate', scene.gaussians._deformation_table.sum()/scene.gaussians.get_xyz.shape[0], iteration)
             tb_writer.add_histogram(f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1)/100, iteration,max_bins=500)
+        if using_wandb:
+            wandb.log({f'{stage}/scene/opacity_histogram': scene.gaussians.get_opacity})
+            wandb.log({f'{stage}/total_points': scene.gaussians.get_xyz.shape[0]})
+            wandb.log({f'{stage}/deformation_rate': scene.gaussians._deformation_table.sum()/scene.gaussians.get_xyz.shape[0]})
+            wandb.log({f'{stage}/scene/motion_histogram': scene.gaussians._deformation_accum.mean(dim=-1)/100})
         
         torch.cuda.empty_cache()
 def setup_seed(seed):
@@ -395,38 +415,71 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     parser = ArgumentParser(description="Training script parameters")
     setup_seed(6666)
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-    hp = ModelHiddenParams(parser)
+    
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7000,14000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[200, 1000, 3000,7000,14000,25000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 14000, 20000, 30_000, 45000, 60000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
+
+    # grid_searched hyperparams
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--fine_iter", type=int, default = 10000)
+    parser.add_argument("--coarse_iter", type=int, default = 3000)
+    parser.add_argument("--netork_width", type=int, default = 128)
+    parser.add_argument("--bs", type=int, default = 16)
+
+    lp = ModelParams(parser)
+    op = OptimizationParams(parser)
+    pp = PipelineParams(parser)
+    hp = ModelHiddenParams(parser)
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.configs:
-        import mmcv
+        import mmengine
         from utils.params_utils import merge_hparams
-        config = mmcv.Config.fromfile(args.configs)
+        config = mmengine.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
     print("Optimizing " + args.model_path)
 
+    if args.wandb:
+        print("intializing Weights and Biases...")
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="4DGaussians",
+
+            # track hyperparameters and run metadata
+            config={
+            "experiment_name" : args.expname,
+            "coarse iterations": args.coarse_iter,
+            "fine iterations": args.fine_iter,
+            }
+        )
+
     # Initialize system state (RNG)
-    safe_state(args.quiet)
+    #safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname)
+
+    # Manual setting for sweeps
+    op_params = op.extract(args)
+    op_params.iterations =  args.fine_iter
+    op_params.coarse_iterations =  args.coarse_iter
+    op_params.batch_size =  args.bs
+
+    hp_params = hp.extract(args)
+    hp_params.net_width =  args.netork_width
+
+    training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb)
 
     # All done
     print("\nTraining complete.")

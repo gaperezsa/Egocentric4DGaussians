@@ -29,6 +29,13 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
         depth_np = depth.permute(1, 2, 0).cpu().numpy()
         depth_np /= depth_np.max()
         depth_np = np.repeat(depth_np, 3, axis=2)
+         
+        # Aria rotated images fixing
+        gt_np = np.rot90(gt_np,k=3,axes=(0,1))
+        image_np = np.rot90(image_np,k=3,axes=(0,1))
+        depth_np = np.rot90(depth_np,k=3,axes=(0,1))
+
+
         image_np = np.concatenate((gt_np, image_np, depth_np), axis=1)
         image_with_labels = Image.fromarray((np.clip(image_np,0,1) * 255).astype('uint8'))  # 转换为8位图像
         # 创建PIL图像对象的副本以绘制标签
@@ -59,20 +66,24 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
     if not os.path.exists(image_path):
         os.makedirs(image_path)
     # image:3,800,800
-    
-    # point_save_path = os.path.join(point_cloud_path,f"{iteration}.jpg")
+
+    pc_mask = gaussians.get_opacity
+    pc_mask = pc_mask > 0.1
+
+
+    point_save_path = os.path.join(point_cloud_path,f"{iteration}.jpg")
     for idx in range(len(viewpoints)):
-        image_save_path = os.path.join(image_path,f"{iteration}_{idx}.jpg")
+        image_save_path = os.path.join(image_path,f"{iteration:05}_{idx}.jpg")
         render(gaussians,viewpoints[idx],image_save_path,scaling = 1,cam_type=dataset_type)
+        if np.random.rand() > 0.5:
+            xyz = gaussians.get_xyz.detach()[pc_mask.squeeze()].cpu().permute(1,0).numpy()
+            visualize_and_save_point_cloud(xyz, viewpoints[idx].R, viewpoints[idx].T, point_save_path)
     # render(gaussians,point_save_path,scaling = 0.1)
     # 保存带有标签的图像
 
     
     
-    pc_mask = gaussians.get_opacity
-    pc_mask = pc_mask > 0.1
-    xyz = gaussians.get_xyz.detach()[pc_mask.squeeze()].cpu().permute(1,0).numpy()
-    # visualize_and_save_point_cloud(xyz, viewpoint.R, viewpoint.T, point_save_path)
+    
     # 如果需要，您可以将PIL图像转换回PyTorch张量
     # return image
     # image_with_labels_tensor = torch.tensor(image_with_labels, dtype=torch.float32).permute(2, 0, 1) / 255.0

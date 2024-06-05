@@ -90,7 +90,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id
-        R = np.transpose(qvec2rotmat(extr.qvec))
+        #R = np.transpose(qvec2rotmat(extr.qvec))
+        degrees_90_x_rot = np.array([[1,0,0],[0,-1,0],[0,0,1]])
+        R = np.array(qvec2rotmat(extr.qvec))
+        R = np.matmul(R,degrees_90_x_rot)
         T = np.array(extr.tvec)
 
         if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL"]:
