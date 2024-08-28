@@ -20,6 +20,9 @@ def lpips_loss(img1, img2, lpips_model):
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
+def l1_filtered_loss(network_output, gt, filter):
+    return torch.abs((network_output[filter] - gt[filter])).mean()
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 

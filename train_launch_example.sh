@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python train.py -s /home/gperezsantamaria/gperezsantamaria_2/4DGaussians/data/ADT/ARIA-processed-V3/colmap --bs=8 --coarse_iter=2221 --configs=/home/gperezsantamaria/gperezsantamaria_2/4DGaussians/arguments/ADT/default.py --expname=wandb_sweeping6 --fine_iter=49705 --port=6062

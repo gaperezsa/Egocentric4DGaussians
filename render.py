@@ -23,6 +23,7 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, ModelHiddenParams
 from gaussian_renderer import GaussianModel
 from time import time
+from pathlib import Path
 # import torch.multiprocessing as mp
 import threading
 import concurrent.futures
@@ -88,8 +89,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     multithread_write(render_list, render_path)
 
-    
-    imageio.mimwrite(os.path.join(model_path, name, "ours_rotated_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
+    Path(os.path.join(model_path, name, "ours_new_{}".format(iteration))).mkdir(parents=True, exist_ok=True)
+    imageio.mimwrite(os.path.join(model_path, name, "ours_new_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, aria: bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)
@@ -117,6 +118,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--skip_video", action="store_true")
     parser.add_argument("--aria", action="store_true")
+    parser.add_argument("--separate_depth_supervised", action="store_true")
     parser.add_argument("--configs", type=str)
     args = get_combined_args(parser)
     print("Rendering " , args.model_path)

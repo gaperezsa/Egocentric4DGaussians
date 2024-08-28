@@ -39,6 +39,10 @@ class CameraInfo(NamedTuple):
     image: np.array
     image_path: str
     image_name: str
+    depth_image: np.array
+    depth_path: str
+    segmentation : np.array
+    bounding_box_mask: np.array
     width: int
     height: int
     time : float
@@ -76,13 +80,14 @@ def getNerfppNorm(cam_info):
     # breakpoint()
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folder = None):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
         sys.stdout.flush()
+        
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
@@ -91,9 +96,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         uid = intr.id
         #R = np.transpose(qvec2rotmat(extr.qvec))
-        degrees_90_x_rot = np.array([[1,0,0],[0,-1,0],[0,0,1]])
+        #degrees_90_x_rot = np.array([[1,0,0],[0,-1,0],[0,0,1]])
         R = np.array(qvec2rotmat(extr.qvec))
-        R = np.matmul(R,degrees_90_x_rot)
+        #R = np.matmul(R,degrees_90_x_rot)
         T = np.array(extr.tvec)
 
         if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL"]:
@@ -117,9 +122,35 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
         image = PILtoTorch(image,None)
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height,
-                              time = float(idx/len(cam_extrinsics)), mask=None) # default by monocular settings.
+        
+        depth_path = image_path.split("colmap")[0] + "depth/" + image_name.replace("camera_rgb","camera_depth") + ".png"
+        segmentation_path = image_path.split("colmap")[0] + "segmentation/" + image_name.replace("camera_rgb","camera_segmentation") + ".npy"
+        bounding_box_path = image_path.split("colmap")[0] + "bounding_boxes/" + image_name.replace("camera_rgb","bounding_box") + ".npy"
+        if os.path.isfile(depth_path):
+            depth_image = Image.open(depth_path)
+            depth_image = torch.from_numpy((np.array(depth_image).astype(np.float32))/1000) #mm to meters
+            
+            segmentation = None
+            #if os.path.isfile(segmentation_path):
+            #    segmentation = np.load(segmentation_path)
+            #else:
+            #    segmentation = None
+                
+            if os.path.isfile(bounding_box_path):
+                bounding_box_mask = np.load(bounding_box_path).astype(bool)
+            else:
+                bounding_box_mask = None
+            
+            
+            cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                    image_path=image_path, image_name=image_name, depth_image=depth_image, depth_path=depth_path, segmentation=segmentation, bounding_box_mask=bounding_box_mask,  width=width, height=height,
+                                    time = float(idx/len(cam_extrinsics)), mask=None)
+            
+        else:
+            cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                 image_path=image_path, image_name=image_name, depth_image=None, depth_path=None, segmentation=None, bounding_box_mask=None, width=width, height=height,
+                                time = float(idx/len(cam_extrinsics)), mask=None) # default by monocular settings.
+            
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

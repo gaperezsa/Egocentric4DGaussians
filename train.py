@@ -13,7 +13,7 @@ import random
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
+from utils.loss_utils import l1_loss,l1_filtered_loss, ssim, l2_loss, lpips_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -31,6 +31,7 @@ import lpips
 from utils.scene_utils import render_training_image
 from time import time
 import copy
+import json
 
 import wandb
 
@@ -76,12 +77,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
-
-
     if not viewpoint_stack and not opt.dataloader:
         # dnerf's branch
         viewpoint_stack = [i for i in train_cams]
         temp_list = copy.deepcopy(viewpoint_stack)
+        filtered = [c for c in viewpoint_stack if c.depth_image is not None]
     # 
     batch_size = opt.batch_size
     print("data loading done")
@@ -98,7 +98,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     
     
     # dynerf, zerostamp_init
-    # breakpoint()
     if stage == "coarse" and opt.zerostamp_init:
         load_in_memory = True
         # batch_size = 4
@@ -108,6 +107,16 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         load_in_memory = False 
                             # 
     count = 0
+
+    # segmentation json
+    try:
+        segmentation_file = open(dataset.source_path.replace(args.source_path.split("/")[-1], "instances.json"))
+        segmentation_instances = json.load(segmentation_file)
+        segmentation_instances['0'] = {'instance_id': 0, 'instance_name': 'empty', 'prototype_name': 'empty', 'category': 'nothing', 'category_uid': 0, 'motion_type': 'static', 'instance_type': 'human', 'rigidity': 'deformable', 'rotational_symmetry': {'is_annotated': False}, 'canonical_pose': {'up_vector': [0, 1, 0], 'front_vector': [0, 0, 1]}}
+    except:
+        print("nno segmentation instances file found")
+
+
     for iteration in range(first_iter, final_iter+1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -175,39 +184,75 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+            
+        batch_dynamic_movement_loss = 0
         images = []
+        depth_images = []
         gt_images = []
+        gt_depth_images = []
+        gt_dynamic_static_masks = []
+        gt_bounding_box_masks = []
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
-            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, time_dynamic_loss=opt.time_dynamic_loss)
+            image, depth_image, viewspace_point_tensor, visibility_filter, radii, dynamic_movement_loss = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["dynamic_movement_loss"]
             images.append(image.unsqueeze(0))
             if scene.dataset_type!="PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
             else:
                 gt_image  = viewpoint_cam['image'].cuda()
+               
+            if  viewpoint_cam.depth_image is not None and viewpoint_cam.bounding_box_mask is not None:
+                if viewpoint_cam.depth_image.max().item() < 1:
+                    print("depth exists but its collapsed near the camera, ignoring this annotation")
+                    gt_depth_image = None
+                else:
+                    #print("depth exists and is valid")
+                    depth_images.append(depth_image.squeeze().unsqueeze(0))
+                    gt_depth_image = viewpoint_cam.depth_image.cuda()
+                    gt_depth_images.append(gt_depth_image.unsqueeze(0))
+                    bounding_box_mask = ~torch.tensor(viewpoint_cam.bounding_box_mask).cuda() #opposite of the bounding box for mask in depth filter
+                    gt_bounding_box_masks.append(bounding_box_mask.unsqueeze(0))
+                    #static_mask = torch.tensor([[segmentation_instances[str(x)]['motion_type'] == 'static' for x in i] for i in viewpoint_cam.segmentation]).cuda()
+                    #gt_dynamic_static_masks.append(static_mask.unsqueeze(0))
+            else:
+                gt_depth_image  = None
             
             gt_images.append(gt_image.unsqueeze(0))
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
+            if dynamic_movement_loss is not None:
+                batch_dynamic_movement_loss += dynamic_movement_loss
         
 
         radii = torch.cat(radii_list,0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
-        # Loss
+        
+         # Loss
         # breakpoint()
         Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-
+        Depth_l1 = 0
+        
+        if len(gt_depth_images) > 0:
+            depth_image_tensor = torch.cat(depth_images,0)
+            gt_depth_image_tensor = torch.cat(gt_depth_images,0)
+            gt_bounding_box_tensor = torch.cat(gt_bounding_box_masks,0)
+            #gt_dynamic_static_masks_tensor = torch.cat(gt_dynamic_static_masks,0)
+            Depth_l1 = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, gt_bounding_box_tensor)
+            loss = Ll1 + (0.5 * Depth_l1)
+        else:
+            loss = Ll1
+            
+        loss += batch_dynamic_movement_loss
+        
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
         
-
-        loss = Ll1
         if stage == "fine" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
@@ -243,7 +288,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # Log and save
             timer.pause()
-            training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
+            training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
@@ -310,8 +355,8 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                              checkpoint_iterations, checkpoint, debug_from,
                              gaussians, scene, "coarse", tb_writer, using_wandb, opt.coarse_iterations, timer)
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
-                         checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, "fine", tb_writer, using_wandb, opt.iterations,timer)
+                             checkpoint_iterations, checkpoint, debug_from,
+                             gaussians, scene, "fine", tb_writer, using_wandb, opt.iterations, timer)
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:
@@ -336,13 +381,14 @@ def prepare_output_and_logger(expname):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
+def training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
     if tb_writer:
         tb_writer.add_scalar(f'{stage}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{stage}/train_loss_patchestotal_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{stage}/iter_time', elapsed, iteration)
     if using_wandb:
         wandb.log({f'{stage}/train_loss_patches/l1_loss': Ll1.item(), f'{stage}/train_loss_patches/total_loss': loss.item(), f'{stage}/iter_time' : elapsed})
+        wandb.log({f'{stage}/train_PSNR': psnr_,f'{stage}/iter_time' : elapsed})
         
     
     # Report test and samples of training set
@@ -420,13 +466,14 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[200, 1000, 3000,7000,14000,25000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 14000, 20000, 30_000, 45000, 60000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 7000,14000,25000,45000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 40, 9999, 10040, 14000, 20000, 30000, 45000, 60000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[40, 9999, 10040, 14000, 20000, 30000, 45000, 60000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
+    parser.add_argument("--time_dynamic_loss", action="store_true")
 
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
@@ -475,9 +522,11 @@ if __name__ == "__main__":
     op_params.iterations =  args.fine_iter
     op_params.coarse_iterations =  args.coarse_iter
     op_params.batch_size =  args.bs
+    op_params.time_dynamic_loss =  args.time_dynamic_loss
 
     hp_params = hp.extract(args)
     hp_params.net_width =  args.netork_width
+
 
     training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb)
 

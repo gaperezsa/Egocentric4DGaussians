@@ -9,6 +9,7 @@ screenshots
 data/
 data
 raw_ADT_data/
+exploring_ADT_data/
 submodules/
 wandb/
 debugging*

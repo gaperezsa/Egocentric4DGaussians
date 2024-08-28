@@ -73,7 +73,7 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
 
     point_save_path = os.path.join(point_cloud_path,f"{iteration}.jpg")
     for idx in range(len(viewpoints)):
-        image_save_path = os.path.join(image_path,f"{iteration:05}_{idx}.jpg")
+        image_save_path = os.path.join(image_path,f"{iteration:05}{idx:03}.jpg")
         render(gaussians,viewpoints[idx],image_save_path,scaling = 1,cam_type=dataset_type)
         if np.random.rand() > 0.5:
             xyz = gaussians.get_xyz.detach()[pc_mask.squeeze()].cpu().permute(1,0).numpy()

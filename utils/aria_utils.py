@@ -6,6 +6,7 @@ import numpy as np
 import open3d as o3d
 import random
 import shutil
+import csv
 
 import cv2
 import numpy as np
@@ -13,6 +14,10 @@ import os
 
 from projectaria_tools.core import data_provider, calibration
 from projectaria_tools.core.image import InterpolationMethod
+from projectaria_tools.core.stream_id import StreamId
+from projectaria_tools.core.sensor_data import TimeDomain, TimeQueryOptions
+
+from tqdm import tqdm
 
 def magnify_image(image, scale=1.0):
     center = (image.shape[1] // 2, image.shape[0] // 2)
@@ -27,6 +32,29 @@ def create_data_provider(vrsfile):
         print("Invalid vrs data provider")
         return None
     return provider
+
+
+
+
+def undistort_depth_fisheye_image(input_path, output_path, provider,pinhole_width = 1408,pinhole_height=1408,focal_length=610.9410078676575):
+    device_calib = provider.get_device_calibration()
+    src_calib = device_calib.get_camera_calib("camera-rgb")
+    #dst_calib = calibration.get_linear_camera_calibration(1024, 1024, 300, "camera-rgb")
+    dst_calib = calibration.get_linear_camera_calibration(pinhole_width, pinhole_height, focal_length, "camera-rgb")
+
+    # Read image
+    #numpy_array = np.load(input_path)
+    img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+    #img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    h, w = img.shape[:2]
+
+    # Undistort image
+    rectified_array = calibration.distort_depth_by_calibration(img, dst_calib, src_calib)
+    # Optionally magnify or crop the image to reduce black borders
+    # rectified_array = magnify_image(rectified_array, scale=1.1)  # Assuming a magnify_image function exists
+
+    # Save the corrected image
+    cv2.imwrite(output_path, rectified_array)
 
 def undistort_fisheye_image(input_path, output_path, provider,pinhole_width = 1408,pinhole_height=1408,focal_length=610.9410078676575):
     device_calib = provider.get_device_calibration()
@@ -48,17 +76,50 @@ def undistort_fisheye_image(input_path, output_path, provider,pinhole_width = 14
     # Save the corrected image
     cv2.imwrite(output_path, rectified_array)
 
+def undistort_fisheye_segmentation(input_path, output_path, provider,pinhole_width = 1408,pinhole_height=1408,focal_length=610.9410078676575):
+    device_calib = provider.get_device_calibration()
+    src_calib = device_calib.get_camera_calib("camera-rgb")
+    #dst_calib = calibration.get_linear_camera_calibration(1024, 1024, 300, "camera-rgb")
+    dst_calib = calibration.get_linear_camera_calibration(pinhole_width, pinhole_height, focal_length, "camera-rgb")
+
+    # Read image
+    img = np.load(input_path)
+    #img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    h, w = img.shape[:2]
+
+    # Undistort image
+    rectified_array = calibration.distort_by_calibration(img, dst_calib, src_calib, InterpolationMethod.NEAREST_NEIGHBOR)
+
+    # Optionally magnify or crop the image to reduce black borders
+    # rectified_array = magnify_image(rectified_array, scale=1.1)  # Assuming a magnify_image function exists
+
+    # Save the corrected image
+    np.save(output_path, rectified_array)
+
 def process_aria_fisheye(input_folder, output_folder, vrsfile, pinhole_width, pinhole_height, focal_length):
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
     
     provider = create_data_provider(vrsfile)
 
-    for file_name in os.listdir(input_folder):
-        if file_name.lower().endswith(('png', 'jpg', 'jpeg')):
+    for file_name in tqdm(os.listdir(input_folder)):
+        if file_name.lower().startswith('camera_depth'):
+            input_path = os.path.join(input_folder, file_name)
+            output_path = os.path.join(output_folder, file_name)
+            undistort_depth_fisheye_image(input_path, output_path, provider,pinhole_width,pinhole_height,focal_length)
+        elif file_name.lower().startswith('camera_rgb'):
             input_path = os.path.join(input_folder, file_name)
             output_path = os.path.join(output_folder, file_name)
             undistort_fisheye_image(input_path, output_path, provider,pinhole_width,pinhole_height,focal_length)
+        elif file_name.lower().startswith('camera_segmentation'):
+            input_path = os.path.join(input_folder, file_name)
+            output_path = os.path.join(output_folder, file_name)
+            undistort_fisheye_segmentation(input_path, output_path, provider,pinhole_width,pinhole_height,focal_length)
+        elif file_name.lower().startswith('bounding_box'):
+            input_path = os.path.join(input_folder, file_name)
+            output_path = os.path.join(output_folder, file_name)
+            undistort_fisheye_segmentation(input_path, output_path, provider,pinhole_width,pinhole_height,focal_length)
+        
 
 
 def read_images_id_mapping(images_txt_path):
@@ -168,22 +229,40 @@ def organize_images_for_colmap(base_path):
     colmap_path = os.path.join(base_path, 'colmap')
     images_path_colmap = os.path.join(colmap_path, 'images')
     images_path_base = os.path.join(base_path, 'images')
+    depth_path_base = os.path.join(base_path, 'depth')
+    segmentation_path_base = os.path.join(base_path, 'segmentation')
+    bounding_boxes_path_base = os.path.join(base_path, 'bounding_boxes')
 
     # Ensure the 'colmap' directory and both 'images' directories exist
-    for path in [colmap_path, images_path_colmap, images_path_base]:
+    for path in [colmap_path, images_path_colmap, images_path_base, depth_path_base, segmentation_path_base, bounding_boxes_path_base]:
         if not os.path.exists(path):
             os.makedirs(path)
             print(f"Created directory: {path}")
 
     # Find and copy (not move to keep in both locations) all .jpg files to the 'images' directories
     for filename in os.listdir(base_path):
-        if filename.endswith('.jpg'):
+        if filename.lower().startswith('camera_rgb'):
             src_path = os.path.join(base_path, filename)
             dst_path_colmap = os.path.join(images_path_colmap, filename)
             dst_path_base = os.path.join(images_path_base, filename)
             shutil.copy(src_path, dst_path_colmap)
             shutil.move(src_path, dst_path_base)
             print(f"Copied {filename} to {images_path_colmap} and {images_path_base}")
+        elif filename.lower().startswith('camera_depth'):
+            src_path = os.path.join(base_path, filename)
+            dst_path_base = os.path.join(depth_path_base, filename)
+            shutil.move(src_path, dst_path_base)
+            print(f"Moved {filename} to {depth_path_base}")
+        if filename.lower().startswith('camera_segmentation'):
+            src_path = os.path.join(base_path, filename)
+            dst_path_base = os.path.join(segmentation_path_base, filename)
+            shutil.move(src_path, dst_path_base)
+            print(f"Moved {filename} to {segmentation_path_base}")
+        if filename.lower().startswith('bounding_box'):
+            src_path = os.path.join(base_path, filename)
+            dst_path_base = os.path.join(bounding_boxes_path_base, filename)
+            shutil.move(src_path, dst_path_base)
+            print(f"Moved {filename} to {bounding_boxes_path_base}")
 
 def add_normals_and_colors_to_ply(input_path, output_path):
     # Load the original PLY file
@@ -272,10 +351,10 @@ def create_images_txt(frames, output_path='images.txt'):
 def main():
     #put None to use aria transforms.json default
     pinhole_width,pinhole_height,focal_length = 1220,1220,None
-    base_folder_path = '/home/gperezsantamaria/gperezsantamaria_2/4DGaussians/data/ADT/ApartmentMealSeq137Aria_processed_rot_-1_1_-1_1'
+    base_folder_path = '/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/data/ADT/NewApartmentMealSeq137M1292'
     json_path = os.path.join(base_folder_path, 'transforms.json')
     transformed_output_json_path = os.path.join(base_folder_path, 'colmap_transforms.json')
-    sample_vrs_file_path = '/home/gperezsantamaria/gperezsantamaria_2/4DGaussians/raw_ADT_data/Apartment_release_meal_skeleton_seq137/1WM103600M1292_optitrack_release_meal_skeleton_seq137/video.vrs'
+    sample_vrs_file_path = '/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/raw_ADT_data/Apartment_release_meal_skeleton_seq137_M1292/video.vrs'
     images_txt_path = os.path.join(base_folder_path, 'colmap', 'sparse', '0', 'images.txt')
     cameras_txt_path = os.path.join(base_folder_path, 'colmap', 'sparse', '0', 'cameras.txt')
     aria_fisheye_images_path = os.path.join(base_folder_path)
@@ -304,7 +383,6 @@ def main():
 
     # Start organizing, creating and copying folders and images
     organize_images_for_colmap(base_folder_path)
-
     # Create the cameras.txt in the specified output directory
     create_cameras_txt(camera_info, cameras_txt_path, pinhole_width, pinhole_height, focal_length)
 
@@ -320,13 +398,6 @@ def main():
 
     # Create the images.txt in the specified output directory
     create_images_txt(data['frames'], images_txt_path)
-
-    # Calculate the path for the database.db file (two levels up from output_path)
-    db_path = os.path.abspath(os.path.join(base_folder_path, 'colmap','database.db'))
-
-    # Create an empty database.db file
-    with open(db_path, 'w') as db_file:
-        pass  # Just creating the file, no need to write anything
 
     # Example usage
     convert_transforms(json_path, images_txt_path, transformed_output_json_path, input_ply_path, pinhole_width, pinhole_height, focal_length)

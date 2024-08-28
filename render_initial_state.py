@@ -39,10 +39,12 @@ def prepare_output(expname):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-def scene_reconstruction(dataset, opt, hyper, pipe, gaussians, scene, stage, timer):
+def scene_reconstruction(dataset, opt, hyper, pipe, checkpoint, gaussians, scene, stage, timer):
 
     gaussians.training_setup(opt)
-
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -60,12 +62,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, gaussians, scene, stage, tim
     batch_size = opt.batch_size
     
     viewpoint_stack = scene.getTrainCameras()
-    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,num_workers=16,collate_fn=list)
+    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,num_workers=0,collate_fn=list)
     print("data loading done")
     iteration = 0
     for viewpoint_cam in viewpoint_stack_loader:    
-        if iteration >= 150:
-            import pdb;pdb.set_trace()
+        if iteration >= 600:
             break
 
         render_training_image(scene, gaussians, viewpoint_cam, render, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
@@ -73,15 +74,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, gaussians, scene, stage, tim
 
 
 
-def render_initial_state(dataset, hyper, opt, pipe, expname,args):
+def render_initial_state(dataset, hyper, opt, pipe, expname, args):
     # first_iter = 0
     prepare_output(expname)
-    gaussians = GaussianModel(dataset.sh_degree, hyper,)
+    if args.load_iteration or args.start_checkpoint:
+        stage="static_fine"
+    else:
+        stage="initial_state_coarse"
+    gaussians = GaussianModel(dataset.sh_degree, hyper)
     dataset.model_path = args.model_path
     timer = Timer()
-    scene = Scene(dataset, gaussians, load_coarse=None, init_random_pcd = args.init_random_pcd)
+    scene = Scene(dataset, gaussians, load_iteration=args.load_iteration, load_coarse=None, init_random_pcd = args.init_random_pcd)
     timer.start()
-    scene_reconstruction(dataset, opt, hyper, pipe, gaussians, scene, "initial_state_coarse", timer)
+    scene_reconstruction(dataset, opt, hyper, pipe, args.start_checkpoint, gaussians, scene, stage, timer)
 
 
 
@@ -96,6 +101,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--load_iteration", type=int, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
 

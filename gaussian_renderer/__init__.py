@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None, time_dynamic_loss=False):
     """
     Render the scene. 
     
@@ -65,6 +65,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc._opacity
     shs = pc.get_features
+    dynamic_movement_loss = None
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -87,6 +88,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means3D_final, scales_final, rotations_final, opacity_final, shs_final = pc._deformation(means3D, scales, 
                                                                  rotations, opacity, shs,
                                                                  time)
+        if time_dynamic_loss:
+            reference_time = max(viewpoint_camera.time-0.1,0.0)
+            reference_time = torch.tensor(reference_time).to(means3D.device).repeat(means3D.shape[0],1)
+            means3D_reference, scales_reference, rotations_reference, opacity_reference, shs_reference = pc._deformation(means3D, scales, 
+                                                                    rotations, opacity, shs,
+                                                                    reference_time)
+            dynamic_movement_loss = abs(means3D_reference-means3D_final).mean()
     else:
         raise NotImplementedError
 
@@ -96,7 +104,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # print("asset value:",time2-time1)
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
-    opacity = pc.opacity_activation(opacity_final)
+    opacity_final = pc.opacity_activation(opacity_final)
     # print(opacity.max())
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -122,7 +130,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means2D = means2D,
         shs = shs_final,
         colors_precomp = colors_precomp,
-        opacities = opacity,
+        opacities = opacity_final,
         scales = scales_final,
         rotations = rotations_final,
         cov3D_precomp = cov3D_precomp)
@@ -135,5 +143,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
-            "depth":depth}
+            "depth":depth,
+            "dynamic_movement_loss": dynamic_movement_loss}
 
