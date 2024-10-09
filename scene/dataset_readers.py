@@ -124,8 +124,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         image = PILtoTorch(image,None)
         
         depth_path = image_path.split("colmap")[0] + "depth/" + image_name.replace("camera_rgb","camera_depth") + ".png"
-        segmentation_path = image_path.split("colmap")[0] + "segmentation/" + image_name.replace("camera_rgb","camera_segmentation") + ".npy"
-        bounding_box_path = image_path.split("colmap")[0] + "bounding_boxes/" + image_name.replace("camera_rgb","bounding_box") + ".npy"
+        #segmentation_path = image_path.split("colmap")[0] + "segmentation/" + image_name.replace("camera_rgb","camera_segmentation") + ".npy"
+        #bounding_box_path = image_path.split("colmap")[0] + "bounding_boxes/" + image_name.replace("camera_rgb","bounding_box") + ".npy"
         if os.path.isfile(depth_path):
             depth_image = Image.open(depth_path)
             depth_image = torch.from_numpy((np.array(depth_image).astype(np.float32))/1000) #mm to meters
@@ -135,11 +135,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
             #    segmentation = np.load(segmentation_path)
             #else:
             #    segmentation = None
-                
-            if os.path.isfile(bounding_box_path):
-                bounding_box_mask = np.load(bounding_box_path).astype(bool)
-            else:
-                bounding_box_mask = None
+            
+            bounding_box_mask = None
+            #if os.path.isfile(bounding_box_path):
+            #    bounding_box_mask = np.load(bounding_box_path).astype(bool)
+            #else:
+            #    bounding_box_mask = None
             
             
             cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,

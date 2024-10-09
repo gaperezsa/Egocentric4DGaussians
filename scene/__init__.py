@@ -85,11 +85,11 @@ class Scene:
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
+                                                           "coarse_iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
             self.gaussians.load_model(os.path.join(self.model_path,
                                                     "point_cloud",
-                                                    "iteration_" + str(self.loaded_iter),
+                                                    "coarse_iteration_" + str(self.loaded_iter),
                                                    ))
         else:
             if init_random_pcd:

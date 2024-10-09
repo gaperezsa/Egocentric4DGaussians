@@ -15,7 +15,36 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None, time_dynamic_loss=False):
+
+def save_pointcloud_as_ply(tensor, filename):
+    """
+    Save a Nx3 torch tensor as a .ply point cloud file.
+
+    Args:
+        tensor (torch.Tensor): A Nx3 tensor containing the point cloud data.
+        filename (str): The name of the file to save the point cloud to.
+    """
+    if tensor.shape[1] != 3:
+        raise ValueError("Tensor must have a shape of Nx3.")
+
+    # Convert tensor to numpy array
+    points = tensor.cpu().numpy()
+
+    # Write the PLY file
+    with open(filename, 'w') as ply_file:
+        ply_file.write(f"ply\n")
+        ply_file.write(f"format ascii 1.0\n")
+        ply_file.write(f"element vertex {points.shape[0]}\n")
+        ply_file.write(f"property float x\n")
+        ply_file.write(f"property float y\n")
+        ply_file.write(f"property float z\n")
+        ply_file.write(f"end_header\n")
+        
+        for point in points:
+            ply_file.write(f"{point[0]} {point[1]} {point[2]}\n")
+    
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None, time_dynamic_loss=False, out_of_frame_loss_flag = False):
     """
     Render the scene. 
     
@@ -61,11 +90,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # add deformation to each points
     # deformation = pc.get_deformation
 
-    
     means2D = screenspace_points
     opacity = pc._opacity
     shs = pc.get_features
     dynamic_movement_loss = None
+    out_of_frame_stillness_loss = None
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -78,7 +107,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc._scaling
         rotations = pc._rotation
     deformation_point = pc._deformation_table
-    if "coarse" in stage:
+    if "coarse" in stage or "general_depth" in stage:
         means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
     elif "fine" in stage:
         # time0 = get_time()
@@ -95,6 +124,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                                                                     rotations, opacity, shs,
                                                                     reference_time)
             dynamic_movement_loss = abs(means3D_reference-means3D_final).mean()
+            
+        
     else:
         raise NotImplementedError
 
@@ -139,10 +170,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # breakpoint()
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
+    # Compute a loss corresponding to things outside frame changing position, scale, rotation, opacity or color
+    if out_of_frame_loss_flag and "fine" in stage:
+        if len(pc.last_seen_means_scale_rot_opacity_shs)!=0 and pc.last_seen_means_scale_rot_opacity_shs["means3D_final"].shape == means3D_final.shape:
+            out_of_frame_stillness_loss = pc.compute_masked_absolute_differences(means3D_final, scales_final, rotations_final, opacity_final, shs_final, ~(radii > 0))
+        
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
             "depth":depth,
-            "dynamic_movement_loss": dynamic_movement_loss}
+            "dynamic_movement_loss": dynamic_movement_loss,
+            "out_of_frame_stillness_loss": out_of_frame_stillness_loss
+            }
 

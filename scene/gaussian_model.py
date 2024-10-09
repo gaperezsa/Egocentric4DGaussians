@@ -64,7 +64,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self._deformation_table = torch.empty(0)
+        self.last_seen_means_scale_rot_opacity_shs = {}
         self.setup_functions()
+        
 
     def capture(self):
         return (
@@ -671,3 +673,30 @@ class GaussianModel:
         return total
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+
+    def capture_reference_deformation_by_time(self, time):
+        means3D = self.get_xyz
+        opacity = self._opacity
+        shs = self.get_features
+        scales = self._scaling
+        rotations = self._rotation
+        time = torch.tensor(time).to(means3D.device).repeat(means3D.shape[0],1)
+        means3D_final, _, _, _, _ = self._deformation(means3D, scales,rotations, opacity, shs,time)
+        self.last_seen_means_scale_rot_opacity_shs["means3D_final"] = means3D_final.detach()
+        #self.last_seen_means_scale_rot_opacity_shs["scales_final"] = scales.detach()
+        #self.last_seen_means_scale_rot_opacity_shs["rotations_final"] = rot.detach()
+        #self.last_seen_means_scale_rot_opacity_shs["opacity_final"] = opacity.detach()
+        #self.last_seen_means_scale_rot_opacity_shs["shs_final"] = shs.detach()
+    
+    def compute_masked_absolute_differences(self, pcd, scales, rot, opacity, shs, mask):
+        loss = torch.nanmean(abs(self.last_seen_means_scale_rot_opacity_shs["means3D_final"][mask] - pcd[mask]))
+        if torch.isnan(loss).any():
+            print("nan out of frame loss escaped")
+            return 0
+        else:
+            return loss
+        #abs(self.last_seen_means_scale_rot_opacity_shs["scales_final"][mask] - scales[mask]).mean() + \
+        #abs(self.last_seen_means_scale_rot_opacity_shs["rotations_final"][mask] - rot[mask]).mean() + \
+        #abs(self.last_seen_means_scale_rot_opacity_shs["opacity_final"][mask] - opacity[mask]).mean() + \
+        #abs(self.last_seen_means_scale_rot_opacity_shs["shs_final"][mask] - shs[mask]).mean()
+    

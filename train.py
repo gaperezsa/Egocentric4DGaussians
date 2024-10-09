@@ -13,7 +13,7 @@ import random
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss,l1_filtered_loss, ssim, l2_loss, lpips_loss
+from utils.loss_utils import l1_loss,l1_filtered_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -42,6 +42,18 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+    
+    
+def check_and_sort_viewpoint_stack(viewpoint_stack):
+    # Check if the list is already sorted
+    is_sorted = all(viewpoint_stack[i].time <= viewpoint_stack[i + 1].time for i in range(len(viewpoint_stack) - 1))
+    
+    if not is_sorted:
+        # Sort the list by the time attribute
+        viewpoint_stack.sort(key=lambda x: x.time)
+        
+    return viewpoint_stack
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, using_wandb, train_iter,timer):
@@ -80,9 +92,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     if not viewpoint_stack and not opt.dataloader:
         # dnerf's branch
         viewpoint_stack = [i for i in train_cams]
+        viewpoint_stack = check_and_sort_viewpoint_stack(viewpoint_stack)
         temp_list = copy.deepcopy(viewpoint_stack)
-        filtered = [c for c in viewpoint_stack if c.depth_image is not None]
-    # 
+        #filtered = [c for c in viewpoint_stack if c.depth_image is not None]
+        
     batch_size = opt.batch_size
     print("data loading done")
     if opt.dataloader:
@@ -114,7 +127,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         segmentation_instances = json.load(segmentation_file)
         segmentation_instances['0'] = {'instance_id': 0, 'instance_name': 'empty', 'prototype_name': 'empty', 'category': 'nothing', 'category_uid': 0, 'motion_type': 'static', 'instance_type': 'human', 'rigidity': 'deformable', 'rotational_symmetry': {'is_annotated': False}, 'canonical_pose': {'up_vector': [0, 1, 0], 'front_vector': [0, 0, 1]}}
     except:
-        print("nno segmentation instances file found")
+        print("no segmentation instances file found")
 
 
     for iteration in range(first_iter, final_iter+1):        
@@ -171,10 +184,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             viewpoint_cams = []
 
             while idx < batch_size :    
-                    
-                viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
                 if not viewpoint_stack :
-                    viewpoint_stack =  temp_list.copy()
+                    if len(viewpoint_cams) > 0:
+                        break
+                    else:
+                        # Re initialize the stack from the begining
+                        viewpoint_stack =  temp_list.copy()
+                        
+                viewpoint_cam = viewpoint_stack.pop(0)
+                
                 viewpoint_cams.append(viewpoint_cam)
                 idx +=1
             if len(viewpoint_cams) == 0:
@@ -186,6 +204,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             pipe.debug = True
             
         batch_dynamic_movement_loss = 0
+        batch_out_of_frame_stillness_loss = 0
         images = []
         depth_images = []
         gt_images = []
@@ -196,27 +215,33 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, time_dynamic_loss=opt.time_dynamic_loss)
-            image, depth_image, viewspace_point_tensor, visibility_filter, radii, dynamic_movement_loss = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["dynamic_movement_loss"]
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, time_dynamic_loss=opt.time_dynamic_loss, out_of_frame_loss_flag=opt.out_of_frame_loss_flag)
+            image, depth_image, viewspace_point_tensor, visibility_filter, radii, dynamic_movement_loss, out_of_frame_stillness_loss = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["dynamic_movement_loss"], render_pkg["out_of_frame_stillness_loss"]
             images.append(image.unsqueeze(0))
             if scene.dataset_type!="PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
             else:
                 gt_image  = viewpoint_cam['image'].cuda()
-               
-            if  viewpoint_cam.depth_image is not None and viewpoint_cam.bounding_box_mask is not None:
+
+            # Does depth exist?
+            if  viewpoint_cam.depth_image is not None and stage != "coarse":
+                # Is depth valid?
                 if viewpoint_cam.depth_image.max().item() < 1:
                     print("depth exists but its collapsed near the camera, ignoring this annotation")
-                    gt_depth_image = None
+                    gt_depth_image = None   
                 else:
-                    #print("depth exists and is valid")
-                    depth_images.append(depth_image.squeeze().unsqueeze(0))
-                    gt_depth_image = viewpoint_cam.depth_image.cuda()
-                    gt_depth_images.append(gt_depth_image.unsqueeze(0))
-                    bounding_box_mask = ~torch.tensor(viewpoint_cam.bounding_box_mask).cuda() #opposite of the bounding box for mask in depth filter
-                    gt_bounding_box_masks.append(bounding_box_mask.unsqueeze(0))
-                    #static_mask = torch.tensor([[segmentation_instances[str(x)]['motion_type'] == 'static' for x in i] for i in viewpoint_cam.segmentation]).cuda()
-                    #gt_dynamic_static_masks.append(static_mask.unsqueeze(0))
+                    # Do we want to filter only depth outside the human bounding boxes?
+                    if opt.bounding_box_masked_depth:
+                        if viewpoint_cam.bounding_box_mask is not None:
+                            bounding_box_mask = ~torch.tensor(viewpoint_cam.bounding_box_mask).cuda() #opposite of the bounding box for mask in depth filter
+                            gt_bounding_box_masks.append(bounding_box_mask.unsqueeze(0))
+                            depth_images.append(depth_image.squeeze().unsqueeze(0))
+                            gt_depth_image = viewpoint_cam.depth_image.cuda()
+                            gt_depth_images.append(gt_depth_image.unsqueeze(0))
+                    else:
+                        depth_images.append(depth_image.squeeze().unsqueeze(0))
+                        gt_depth_image = viewpoint_cam.depth_image.cuda()
+                        gt_depth_images.append(gt_depth_image.unsqueeze(0))
             else:
                 gt_depth_image  = None
             
@@ -226,8 +251,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             viewspace_point_tensor_list.append(viewspace_point_tensor)
             if dynamic_movement_loss is not None:
                 batch_dynamic_movement_loss += dynamic_movement_loss
+            if out_of_frame_stillness_loss is not None:
+                batch_out_of_frame_stillness_loss += out_of_frame_stillness_loss
         
-
+        # Take a reference state for out of frame loss in the next batch
+        if "fine" in stage and opt.out_of_frame_loss_flag:
+            gaussians.capture_reference_deformation_by_time(viewpoint_cam.time)
+            
         radii = torch.cat(radii_list,0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
         image_tensor = torch.cat(images,0)
@@ -236,19 +266,28 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
          # Loss
         # breakpoint()
         Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-        Depth_l1 = 0
-        
-        if len(gt_depth_images) > 0:
+        Depth_loss = 0
+        if len(gt_depth_images) > 0 and stage != "coarse":
             depth_image_tensor = torch.cat(depth_images,0)
             gt_depth_image_tensor = torch.cat(gt_depth_images,0)
-            gt_bounding_box_tensor = torch.cat(gt_bounding_box_masks,0)
-            #gt_dynamic_static_masks_tensor = torch.cat(gt_dynamic_static_masks,0)
-            Depth_l1 = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, gt_bounding_box_tensor)
-            loss = Ll1 + (0.5 * Depth_l1)
+            
+            if "general_depth" in stage:
+                Depth_loss = l1_loss(depth_image_tensor, gt_depth_image_tensor)
+                
+            elif "fine" in stage:
+                if opt.bounding_box_masked_depth:
+                    gt_bounding_box_tensor = torch.cat(gt_bounding_box_masks,0)
+                    #gt_dynamic_static_masks_tensor = torch.cat(gt_dynamic_static_masks,0)
+                    Depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, gt_bounding_box_tensor)
+                else:
+                    Depth_loss = l1_proximity_loss(depth_image_tensor, gt_depth_image_tensor, max=1)
+            
+            loss = Ll1 + (0.5 * Depth_loss)
         else:
             loss = Ll1
-            
-        loss += batch_dynamic_movement_loss
+        
+        # Add new losses with weight hyperparameters
+        loss += hyper.dynamic_movement_weight*batch_dynamic_movement_loss + hyper.frame_stillness_weight*batch_out_of_frame_stillness_loss
         
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
@@ -310,7 +349,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
 
-                if stage == "coarse":
+                if stage == "coarse" or stage == "general_depth":
                     opacity_threshold = opt.opacity_threshold_coarse
                     densify_threshold = opt.densify_grad_threshold_coarse
                 else:    
@@ -354,6 +393,9 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
                              gaussians, scene, "coarse", tb_writer, using_wandb, opt.coarse_iterations, timer)
+    scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+                             checkpoint_iterations, checkpoint, debug_from,
+                             gaussians, scene, "general_depth", tb_writer, using_wandb, opt.general_depth_iterations, timer)
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
                              gaussians, scene, "fine", tb_writer, using_wandb, opt.iterations, timer)
@@ -466,19 +508,24 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 7000,14000,25000,45000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 40, 9999, 10040, 14000, 20000, 30000, 45000, 60000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 9999, 14000, 20000, 45000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 40, 9999, 14000, 20000, 45000, 60000, 100000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[40, 9999, 10040, 14000, 20000, 30000, 45000, 60000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[40, 9999, 14000, 20000, 45000, 60000, 100000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
-    parser.add_argument("--time_dynamic_loss", action="store_true")
-
+    parser.add_argument("--time_dynamic_loss_flag", action="store_true")
+    parser.add_argument('--dynamic_movement_weight', type=float, default=0.5)
+    parser.add_argument("--out_of_frame_loss_flag", action="store_true")
+    parser.add_argument('--frame_stillness_weight', type=float, default=0.5)
+    parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
+    
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--fine_iter", type=int, default = 10000)
     parser.add_argument("--coarse_iter", type=int, default = 3000)
+    parser.add_argument("--general_depth_iter", type=int, default = 3000)
     parser.add_argument("--netork_width", type=int, default = 128)
     parser.add_argument("--bs", type=int, default = 16)
 
@@ -521,11 +568,17 @@ if __name__ == "__main__":
     op_params = op.extract(args)
     op_params.iterations =  args.fine_iter
     op_params.coarse_iterations =  args.coarse_iter
+    op_params.general_depth_iterations =  args.general_depth_iter
     op_params.batch_size =  args.bs
-    op_params.time_dynamic_loss =  args.time_dynamic_loss
+    op_params.time_dynamic_loss =  args.time_dynamic_loss_flag
+    op_params.out_of_frame_loss_flag =  args.out_of_frame_loss_flag
+    op_params.bounding_box_masked_depth = args.bounding_box_masked_depth_flag
 
     hp_params = hp.extract(args)
     hp_params.net_width =  args.netork_width
+    hp_params.dynamic_movement_weight =  args.dynamic_movement_weight
+    hp_params.frame_stillness_weight =  args.frame_stillness_weight
+    
 
 
     training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb)

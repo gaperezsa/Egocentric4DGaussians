@@ -20,6 +20,13 @@ def lpips_loss(img1, img2, lpips_model):
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
+def l1_inverse_distance_loss(network_output, gt):
+    return torch.abs((network_output - gt)/gt).mean()
+
+def l1_proximity_loss(network_output, gt, max=1):
+    close_filter = gt[gt<max]
+    return torch.abs((network_output[close_filter] - gt[close_filter])).mean()
+
 def l1_filtered_loss(network_output, gt, filter):
     return torch.abs((network_output[filter] - gt[filter])).mean()
 
