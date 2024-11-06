@@ -51,6 +51,7 @@ class CameraInfo(NamedTuple):
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
+    close_train_cameras: list
     test_cameras: list
     video_cameras: list
     nerf_normalization: dict
@@ -197,9 +198,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
-    # breakpoint()
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        close_train_cam_infos = [c for c in train_cam_infos if (c.depth_image < 1.0).sum().item() > c.depth_image.nelement() * 0.05]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
@@ -226,6 +227,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
+                           close_train_cameras = close_train_cam_infos,
                            test_cameras=test_cam_infos,
                            video_cameras=train_cam_infos,
                            maxtime=0,

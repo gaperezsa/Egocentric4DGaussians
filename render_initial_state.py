@@ -65,12 +65,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, checkpoint, gaussians, scene
     viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,num_workers=0,collate_fn=list)
     print("data loading done")
     iteration = 0
-    for viewpoint_cam in viewpoint_stack_loader:    
-        if iteration >= 600:
+    for i, viewpoint_cam in enumerate(viewpoint_stack_loader):    
+        if i >= 400:
             break
+        if i < 200:
+            continue
 
-        render_training_image(scene, gaussians, viewpoint_cam, render, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
-        iteration += 1
+        render_training_image(scene, gaussians, viewpoint_cam, render, pipe, background, stage, i,timer.get_elapsed_time(),scene.dataset_type)
+        
 
 
 
@@ -78,7 +80,7 @@ def render_initial_state(dataset, hyper, opt, pipe, expname, args):
     # first_iter = 0
     prepare_output(expname)
     if args.load_iteration or args.start_checkpoint:
-        stage="static_fine"
+        stage="test_close_final"
     else:
         stage="initial_state_coarse"
     gaussians = GaussianModel(dataset.sh_degree, hyper)

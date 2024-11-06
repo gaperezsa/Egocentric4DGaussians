@@ -41,6 +41,7 @@ class Scene:
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
         self.train_cameras = {}
+        self.close_train_cameras = {}
         self.test_cameras = {}
         self.video_cameras = {}
         if os.path.exists(os.path.join(args.source_path, "sparse")):
@@ -69,6 +70,8 @@ class Scene:
         self.cameras_extent = scene_info.nerf_normalization["radius"]
         print("Loading Training Cameras")
         self.train_camera = FourDGSdataset(scene_info.train_cameras, args, dataset_type)
+        print("Loading Training Cameras")
+        self.close_train_camera = FourDGSdataset(scene_info.close_train_cameras, args, dataset_type)
         print("Loading Test Cameras")
         self.test_camera = FourDGSdataset(scene_info.test_cameras, args, dataset_type)
         print("Loading Video Cameras")
@@ -106,7 +109,8 @@ class Scene:
         self.gaussians.save_deformation(point_cloud_path)
     def getTrainCameras(self, scale=1.0):
         return self.train_camera
-
+    def getCloseTrainCameras(self, scale=1.0):
+        return self.close_train_camera
     def getTestCameras(self, scale=1.0):
         return self.test_camera
     def getVideoCameras(self, scale=1.0):

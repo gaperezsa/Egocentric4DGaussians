@@ -15,8 +15,10 @@ import torch
 from random import randint
 from utils.loss_utils import l1_loss,l1_filtered_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss
 from gaussian_renderer import render, network_gui
+from render import render_set_no_compression
+from metrics import evaluate_single_folder
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene, GaussianModel, dynamics_by_depth
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -56,19 +58,9 @@ def check_and_sort_viewpoint_stack(viewpoint_stack):
 
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, using_wandb, train_iter,timer):
-    first_iter = 0
+                         gaussians, scene, stage, tb_writer, using_wandb, train_iter,timer, first_iter=0):
 
     gaussians.training_setup(opt)
-    if checkpoint:
-        # breakpoint()
-        if stage == "coarse" and stage not in checkpoint:
-            print("start from fine stage, skip coarse stage.")
-            # process is in the coarse stage, but start from fine stage
-            return
-        if stage in checkpoint: 
-            (model_params, first_iter) = torch.load(checkpoint)
-            gaussians.restore(model_params, opt)
 
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -89,6 +81,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
+    #if stage == "close_dynamic":
+    #    close_train_cams = scene.getCloseTrainCameras()
+        
     if not viewpoint_stack and not opt.dataloader:
         # dnerf's branch
         viewpoint_stack = [i for i in train_cams]
@@ -122,12 +117,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     count = 0
 
     # segmentation json
-    try:
-        segmentation_file = open(dataset.source_path.replace(args.source_path.split("/")[-1], "instances.json"))
-        segmentation_instances = json.load(segmentation_file)
-        segmentation_instances['0'] = {'instance_id': 0, 'instance_name': 'empty', 'prototype_name': 'empty', 'category': 'nothing', 'category_uid': 0, 'motion_type': 'static', 'instance_type': 'human', 'rigidity': 'deformable', 'rotational_symmetry': {'is_annotated': False}, 'canonical_pose': {'up_vector': [0, 1, 0], 'front_vector': [0, 0, 1]}}
-    except:
-        print("no segmentation instances file found")
+    #try:
+    #    segmentation_file = open(dataset.source_path.replace(args.source_path.split("/")[-1], "instances.json"))
+    #    segmentation_instances = json.load(segmentation_file)
+    #    segmentation_instances['0'] = {'instance_id': 0, 'instance_name': 'empty', 'prototype_name': 'empty', 'category': 'nothing', 'category_uid': 0, 'motion_type': 'static', 'instance_type': 'human', 'rigidity': 'deformable', 'rotational_symmetry': {'is_annotated': False}, 'canonical_pose': {'up_vector': [0, 1, 0], 'front_vector': [0, 0, 1]}}
+    #except:
+    #    print("no segmentation instances file found")
 
 
     for iteration in range(first_iter, final_iter+1):        
@@ -152,7 +147,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive) :
+                if do_training and ((iteration < int(train_iter)) or not keep_alive) :
                     break
             except Exception as e:
                 print(e)
@@ -224,7 +219,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 gt_image  = viewpoint_cam['image'].cuda()
 
             # Does depth exist?
-            if  viewpoint_cam.depth_image is not None and stage != "coarse":
+            if  viewpoint_cam.depth_image is not None and ( stage == "general_depth" or stage == "close_dynamic") :
                 # Is depth valid?
                 if viewpoint_cam.depth_image.max().item() < 1:
                     print("depth exists but its collapsed near the camera, ignoring this annotation")
@@ -267,32 +262,32 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         # breakpoint()
         Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
         Depth_loss = 0
-        if len(gt_depth_images) > 0 and stage != "coarse":
+        if len(gt_depth_images) > 0 and ( stage == "general_depth" or stage == "close_dynamic"):
             depth_image_tensor = torch.cat(depth_images,0)
             gt_depth_image_tensor = torch.cat(gt_depth_images,0)
             
-            if "general_depth" in stage:
+            if stage == "general_depth":
                 Depth_loss = l1_loss(depth_image_tensor, gt_depth_image_tensor)
+                loss = Ll1 + (hyper.general_depth_weight * Depth_loss)
                 
-            elif "fine" in stage:
+            elif stage == "close_dynamic":
                 if opt.bounding_box_masked_depth:
                     gt_bounding_box_tensor = torch.cat(gt_bounding_box_masks,0)
                     #gt_dynamic_static_masks_tensor = torch.cat(gt_dynamic_static_masks,0)
                     Depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, gt_bounding_box_tensor)
                 else:
-                    Depth_loss = l1_proximity_loss(depth_image_tensor, gt_depth_image_tensor, max=1)
-            
-            loss = Ll1 + (0.5 * Depth_loss)
+                    Depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, depth_image_tensor < 1.0)
+                loss = Ll1 + (hyper.close_dynamic_depth_weight * Depth_loss)
         else:
             loss = Ll1
         
         # Add new losses with weight hyperparameters
-        loss += hyper.dynamic_movement_weight*batch_dynamic_movement_loss + hyper.frame_stillness_weight*batch_out_of_frame_stillness_loss
+        # loss += hyper.dynamic_movement_weight*batch_dynamic_movement_loss + hyper.frame_stillness_weight*batch_out_of_frame_stillness_loss
         
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
         
-        if stage == "fine" and hyper.time_smoothness_weight != 0:
+        if stage != "coarse" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
             loss += tv_loss
@@ -303,10 +298,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
         
-        loss.backward()
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
             os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        loss.backward()
+        
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
             viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
@@ -322,7 +319,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                                           "psnr": f"{psnr_:.{2}f}",
                                           "point":f"{total_point}"})
                 progress_bar.update(10)
-            if iteration == opt.iterations:
+            if iteration == train_iter:
                 progress_bar.close()
 
             # Log and save
@@ -337,8 +334,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         or (iteration < 60000 and iteration %  500 == 499) \
                             or (iteration < 200000 and iteration %  1000 == 999) :
                             # breakpoint()
-                            render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                            render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [test_cams[500%len(test_cams)]], render, pipe, background, stage+"_train_", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
                             # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
 
                         # total_images.append(to8b(temp_image).transpose(1,2,0))
@@ -349,12 +346,16 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
 
-                if stage == "coarse" or stage == "general_depth":
+                if stage == "coarse":
                     opacity_threshold = opt.opacity_threshold_coarse
                     densify_threshold = opt.densify_grad_threshold_coarse
-                else:    
+                elif stage == "fine":    
                     opacity_threshold = opt.opacity_threshold_fine_init - iteration*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
-                    densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
+                    densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter ) 
+                else:
+                    opacity_threshold = opt.opacity_threshold_fine_after
+                    densify_threshold = opt.densify_grad_threshold_after
+                    
                 if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
@@ -375,14 +376,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < train_iter:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
+            if (iteration in checkpoint_iterations) or iteration == final_iter:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
-def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, using_wandb):
+def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, using_wandb, training_mode=0):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
@@ -390,16 +391,66 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
     timer.start()
-    scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
-                             checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "coarse", tb_writer, using_wandb, opt.coarse_iterations, timer)
-    scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
-                             checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "general_depth", tb_writer, using_wandb, opt.general_depth_iterations, timer)
-    scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
-                             checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "fine", tb_writer, using_wandb, opt.iterations, timer)
 
+    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    cam_type=scene.dataset_type
+
+    total_iters=opt.coarse_iterations+opt.iterations+opt.general_depth_iterations+opt.close_dynamic_iterations
+    stages=["coarse","fine","general_depth","close_dynamic"]
+    first_iters=[0,0,0,0]
+    training_iters=[opt.coarse_iterations, opt.iterations, opt.general_depth_iterations, opt.close_dynamic_iterations]
+    current_stage = stages[0]
+    
+    if checkpoint:
+        for i, st in enumerate(stages):
+            if st in checkpoint.split("/")[-1]:
+                (model_params, first_iter) = torch.load(checkpoint)
+                gaussians.restore(model_params, opt)
+                #Check checkpoint iter is lower than the set training iters
+                if first_iter > training_iters[i]:
+                    training_iters[i] = first_iter
+
+                #Check the checkpoint iters is not far from the set iters, if so, just load and continue from the next stage
+                if abs(first_iter/(training_iters[i]+1) - 1) > 0.1:
+                    current_stage = stages[i+1]
+                else:
+                    first_iters[i] = first_iter
+                    current_stage = stages[i]
+                break
+
+    if (training_mode == 0 or training_mode == 1) and current_stage == "coarse": ## base training
+        scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+                                checkpoint_iterations, checkpoint, debug_from,
+                                gaussians, scene, "coarse", tb_writer, using_wandb, opt.coarse_iterations, timer, first_iters[0])
+        current_stage = "fine"
+
+    if (training_mode == 0 or training_mode == 1) and current_stage == "fine": ## base training
+        scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+                                checkpoint_iterations, checkpoint, debug_from,
+                                gaussians, scene, "fine", tb_writer, using_wandb, opt.iterations, timer, first_iters[1])
+        current_stage = "general_depth"
+
+    #if (training_mode == 1) and current_stage == "general_depth":   ## 4 stage training
+    #    scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+    #                            checkpoint_iterations, checkpoint, debug_from,
+    #                            gaussians, scene, "general_depth", tb_writer, using_wandb, opt.general_depth_iterations, timer, first_iters[2])
+    #    current_stage = "close_dynamic"
+
+    distances, colors, opacities = dynamics_by_depth.movement_by_rendering(dataset.model_path, "dynamics", scene.getTrainCameras(), gaussians, pipe, background, cam_type)
+    render_set_no_compression(dataset.model_path, "filtered_color_by_movement", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, override_color = colors, override_opacity = opacities)
+    return
+    #if (training_mode == 1) and current_stage == "close_dynamic":   ## 4 stage training
+    #    scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+    #                            checkpoint_iterations, checkpoint, debug_from,
+    #                            gaussians, scene, "close_dynamic", tb_writer, using_wandb, opt.close_dynamic_iterations, timer, first_iters[3])
+    
+    if training_mode == 2: ## probabilistic 2 stage
+        raise NotImplementedError
+    
+    render_set_no_compression(dataset.model_path, "final_train_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True)
+    evaluate_single_folder(os.path.join(dataset.model_path, "final_train_render", "ours_{}".format(total_iters)))
+    
 def prepare_output_and_logger(expname):    
     if not args.model_path:
         # if os.getenv('OAR_JOB_ID'):
@@ -520,12 +571,18 @@ if __name__ == "__main__":
     parser.add_argument("--out_of_frame_loss_flag", action="store_true")
     parser.add_argument('--frame_stillness_weight', type=float, default=0.5)
     parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
+    parser.add_argument('--general_depth_weight', type=float, default=0.5)
+    parser.add_argument('--close_dynamic_depth_weight', type=float, default=1)
     
+    #Which training pipeline, 0 is regular, 1 is with general depth and close depth, 2 is probabilistic paralel depth
+    parser.add_argument('--training_mode', type=int, default=0)
+
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--fine_iter", type=int, default = 10000)
-    parser.add_argument("--coarse_iter", type=int, default = 3000)
-    parser.add_argument("--general_depth_iter", type=int, default = 3000)
+    parser.add_argument("--coarse_iter", type=int, default = 6000)
+    parser.add_argument("--fine_iter", type=int, default = 20000)
+    parser.add_argument("--general_depth_iter", type=int, default = 0)
+    parser.add_argument("--close_dynamic_iter", type=int, default = 0)
     parser.add_argument("--netork_width", type=int, default = 128)
     parser.add_argument("--bs", type=int, default = 16)
 
@@ -566,9 +623,10 @@ if __name__ == "__main__":
 
     # Manual setting for sweeps
     op_params = op.extract(args)
-    op_params.iterations =  args.fine_iter
     op_params.coarse_iterations =  args.coarse_iter
+    op_params.iterations =  args.fine_iter
     op_params.general_depth_iterations =  args.general_depth_iter
+    op_params.close_dynamic_iterations =  args.close_dynamic_iter
     op_params.batch_size =  args.bs
     op_params.time_dynamic_loss =  args.time_dynamic_loss_flag
     op_params.out_of_frame_loss_flag =  args.out_of_frame_loss_flag
@@ -578,10 +636,11 @@ if __name__ == "__main__":
     hp_params.net_width =  args.netork_width
     hp_params.dynamic_movement_weight =  args.dynamic_movement_weight
     hp_params.frame_stillness_weight =  args.frame_stillness_weight
+    hp_params.general_depth_weight = args.general_depth_weight
+    hp_params.close_dynamic_depth_weight = args.close_dynamic_depth_weight
     
 
-
-    training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb)
+    training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb, args.training_mode)
 
     # All done
     print("\nTraining complete.")

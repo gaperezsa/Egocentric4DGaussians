@@ -111,7 +111,89 @@ def evaluate(model_paths):
             
             print("Unable to compute metrics for model", scene_dir)
             raise e
+        
 
+def readImages(renders_dir, gt_dir):
+    renders = []
+    gts = []
+    image_names = []
+    for fname in os.listdir(renders_dir):
+        render = Image.open(renders_dir / fname)
+        gt = Image.open(gt_dir / fname)
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        image_names.append(fname)
+    return renders, gts, image_names
+
+def evaluate_single_folder(folder_path):
+    full_dict = {}
+    per_view_dict = {}
+
+    try:
+        print("Evaluating folder:", folder_path)
+
+        # Define the directories for GT and renders
+        gt_dir = Path(folder_path) / "gt"
+        renders_dir = Path(folder_path) / "renders"
+
+        # Read all images
+        renders, gts, image_names = readImages(renders_dir, gt_dir)
+
+        # Initialize lists to store all metrics
+        ssims = []
+        psnrs = []
+        lpipss = []
+        lpipsa = []
+        ms_ssims = []
+        Dssims = []
+
+        # Evaluate metrics for all images
+        for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+            ssims.append(ssim(renders[idx], gts[idx]))
+            psnrs.append(psnr(renders[idx], gts[idx]))
+            lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+            ms_ssims.append(ms_ssim(renders[idx], gts[idx], data_range=1, size_average=True))
+            lpipsa.append(lpips(renders[idx], gts[idx], net_type='alex'))
+            Dssims.append((1 - ms_ssims[-1]) / 2)
+
+        # Print out the results
+        print("SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
+        print("PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
+        print("LPIPS-vgg: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
+        print("LPIPS-alex: {:>12.7f}".format(torch.tensor(lpipsa).mean(), ".5"))
+        print("MS-SSIM: {:>12.7f}".format(torch.tensor(ms_ssims).mean(), ".5"))
+        print("D-SSIM: {:>12.7f}".format(torch.tensor(Dssims).mean(), ".5"))
+
+        # Store overall metrics
+        full_dict.update({
+            "SSIM": torch.tensor(ssims).mean().item(),
+            "PSNR": torch.tensor(psnrs).mean().item(),
+            "LPIPS-vgg": torch.tensor(lpipss).mean().item(),
+            "LPIPS-alex": torch.tensor(lpipsa).mean().item(),
+            "MS-SSIM": torch.tensor(ms_ssims).mean().item(),
+            "D-SSIM": torch.tensor(Dssims).mean().item()
+        })
+
+        # Store per-image metrics
+        per_view_dict.update({
+            "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
+            "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+            "LPIPS-vgg": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
+            "LPIPS-alex": {name: lp for lp, name in zip(torch.tensor(lpipsa).tolist(), image_names)},
+            "MS-SSIM": {name: lp for lp, name in zip(torch.tensor(ms_ssims).tolist(), image_names)},
+            "D-SSIM": {name: lp for lp, name in zip(torch.tensor(Dssims).tolist(), image_names)}
+        })
+
+        # Write results to files
+        with open(folder_path + "/results.json", 'w') as fp:
+            json.dump(full_dict, fp, indent=True)
+        with open(folder_path + "/per_view.json", 'w') as fp:
+            json.dump(per_view_dict, fp, indent=True)
+
+    except Exception as e:
+        print("Unable to compute metrics for folder", folder_path)
+        raise e
+    
 if __name__ == "__main__":
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)

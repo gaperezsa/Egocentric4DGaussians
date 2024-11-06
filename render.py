@@ -66,12 +66,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
             # Correct for arias innate rotation
             if aria:
-                render_images.append(np.rot90(rendering.transpose(1,2,0),k=3,axes=(0,1)))
+                render_list.append(np.rot90(rendering.transpose(1,2,0),k=3,axes=(0,1)))
             else:
-                render_images.append(rendering.transpose(1,2,0))
+                render_list.append(rendering.transpose(1,2,0))
             # print(to8b(rendering).shape)
-            render_list.append(rendering)
-            if name in ["train", "test"]:
+            if name in ["train", "test", "final_train_render"]:
                 if cam_type != "PanopticSports":
                     gt = view.original_image[0:3, :, :]
                 else:
@@ -86,11 +85,83 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     multithread_write(gt_list, gts_path)
     # print("writing rendering images.")
-
+    breakpoint()
     multithread_write(render_list, render_path)
 
-    Path(os.path.join(model_path, name, "ours_new_{}".format(iteration))).mkdir(parents=True, exist_ok=True)
-    imageio.mimwrite(os.path.join(model_path, name, "ours_new_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
+    Path(os.path.join(model_path, name, "ours_{}".format(iteration))).mkdir(parents=True, exist_ok=True)
+    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
+
+def render_set_no_compression(model_path, name, iteration, views, gaussians, pipeline, background, cam_type, aria=False, override_color = None, override_opacity = None):
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
+    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+
+    makedirs(render_path, exist_ok=True)
+    makedirs(gts_path, exist_ok=True)
+
+    render_list = []
+    gt_list = []
+
+    print("point nums:", gaussians._xyz.shape[0])
+
+    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        with torch.no_grad():
+            if idx == 0:
+                time1 = time()
+
+            # Render the current view, with no gradients required
+            rendering = render(view, gaussians, pipeline, background, cam_type=cam_type, override_color = override_color, override_opacity = override_opacity)["render"]
+
+            # Convert to float16 to save memory and move to CPU to free GPU memory
+            rendering = rendering.half().cpu()
+
+            # Correct for aria's innate rotation
+            if aria:
+                # Rotate the rendered image if aria correction is required
+                rendering = rendering.permute(1, 2, 0)  # Convert to shape (H, W, C)
+                rendering = torch.rot90(rendering, k=3, dims=(0, 1))  # Rotate 270 degrees (k=3)
+                rendering = rendering.permute(2, 0, 1)  # Convert back to shape (C, H, W)
+
+            # Append rendering to the CPU-based list
+            render_list.append(rendering)
+
+            if name in ["train", "test", "final_train_render", "color_by_movement"]:
+                if cam_type != "PanopticSports":
+                    gt = view.original_image[0:3, :, :]
+                    if aria:
+                        # Rotate the GT image if aria correction is required
+                        gt = gt.permute(1, 2, 0)  # Convert to shape (H, W, C)
+                        gt = torch.rot90(gt, k=3, dims=(0, 1))  # Rotate 270 degrees (k=3)
+                        gt = gt.permute(2, 0, 1)  # Convert back to shape (C, H, W)
+
+                else:
+                    gt = view['image']
+                    if aria:
+                        # Rotate the GT image if aria correction is required
+                        gt = gt.permute(1, 2, 0)  # Convert to shape (H, W, C)
+                        gt = torch.rot90(gt, k=3, dims=(0, 1))  # Rotate 270 degrees (k=3)
+                        gt = gt.permute(2, 0, 1)  # Convert back to shape (C, H, W)
+
+                # Move GT to CPU and half precision
+                gt = gt.half().cpu()
+
+                # Append GT to the CPU-based list
+                gt_list.append(gt)
+
+            # Clear GPU memory
+            torch.cuda.empty_cache()
+
+    time2 = time()
+    print("FPS:", (len(views) - 1) / (time2 - time1))
+
+    # Save the images using multithreaded writing to speed up the process
+    multithread_write(gt_list, gts_path)
+    multithread_write(render_list, render_path)
+
+    # Create video from the saved images
+    Path(os.path.join(model_path, name, "ours_{}".format(iteration))).mkdir(parents=True, exist_ok=True)
+    render_images = [imageio.imread(os.path.join(render_path, f'{i:05d}.png')) for i in range(len(views))]
+    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
+
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, aria: bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)

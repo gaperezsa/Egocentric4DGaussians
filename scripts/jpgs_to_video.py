@@ -3,6 +3,7 @@ import os
 import glob
 from tqdm import tqdm
 import time
+import numpy as np
 
 import re
 
@@ -27,7 +28,8 @@ def create_video_from_png(folder_path, output_video_path):
         for file_path in tqdm(sorted_files):
             # Read image unchanged
             image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
-
+            # Rotate the rendered image if aria correction is required
+            #image = np.rot90(image, k=3, axes=(0, 1))  # Rotate 270 degrees (k=3)
             # Write image to video
             video_writer.write(image)
     except Exception as e:
@@ -53,6 +55,6 @@ if __name__ == "__main__":
     
 
     # aria
-    folder_path = "/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/output/bounding_box_depth_filtered/static_fine_render/images"
-    output_video_path = "/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/output/bounding_box_depth_filtered/continious_training/bounding_boxes_filtered_depth_60000_video_30fps.mp4"
+    folder_path = "/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/output/monocular_depth_4stage_coarse_20k_fine_45k_general_45k_close_45k/close_dynamic_train__render/images"
+    output_video_path = "/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/output/monocular_depth_4stage_coarse_20k_fine_45k_general_45k_close_45k/close_dynamic_train__render/close_depth_train_video.mp4"
     create_video_from_png(folder_path, output_video_path)

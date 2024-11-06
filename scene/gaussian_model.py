@@ -687,6 +687,10 @@ class GaussianModel:
         #self.last_seen_means_scale_rot_opacity_shs["rotations_final"] = rot.detach()
         #self.last_seen_means_scale_rot_opacity_shs["opacity_final"] = opacity.detach()
         #self.last_seen_means_scale_rot_opacity_shs["shs_final"] = shs.detach()
+
+    def capture_visible_positions(self, positions, visibility_filter):
+        self.previous_positions = positions.detach()
+        self.previous_visibility = visibility_filter.detach()
     
     def compute_masked_absolute_differences(self, pcd, scales, rot, opacity, shs, mask):
         loss = torch.nanmean(abs(self.last_seen_means_scale_rot_opacity_shs["means3D_final"][mask] - pcd[mask]))
