@@ -30,10 +30,7 @@ class FourDGSdataset(Dataset):
                 caminfo = self.dataset[index]
                 image = caminfo.image
                 depth_image = caminfo.depth_image
-                #segmentation = caminfo.segmentation
-                segmentation = None
-                bounding_box_mask = caminfo.bounding_box_mask
-                
+                dynamic_mask = caminfo.dynamic_mask
                 
                 R = caminfo.R
                 T = caminfo.T
@@ -45,7 +42,7 @@ class FourDGSdataset(Dataset):
             
             return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image,gt_alpha_mask=None,
                         image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
-                        mask=mask, depth_image=depth_image, segmentation=segmentation, bounding_box_mask=bounding_box_mask)
+                        mask=mask, depth_image=depth_image, dynamic_mask=dynamic_mask)
         else:
             return self.dataset[index]
     def __len__(self):

@@ -75,3 +75,17 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+def dice_loss(y_pred, y_true, smooth=1e-6):
+    # Convert boolean tensors to float
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+    
+    # Calculate intersection and the sum of both masks
+    intersection = (y_pred * y_true).sum()
+    union = y_pred.sum() + y_true.sum()
+    
+    # Compute Dice coefficient
+    dice_coeff = (2. * intersection + smooth) / (union + smooth)
+    
+    # Return Dice Loss
+    return 1 - dice_coeff

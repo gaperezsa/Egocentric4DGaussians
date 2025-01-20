@@ -49,6 +49,7 @@ class GaussianModel:
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
+        self._dynamic_xyz = torch.empty(0).type(torch.bool)
         # self._deformation =  torch.empty(0)
         self._deformation = deform_network(args)
         # self.grid = TriPlaneGrid()
@@ -72,6 +73,7 @@ class GaussianModel:
         return (
             self.active_sh_degree,
             self._xyz,
+            self._dynamic_xyz,
             self._deformation.state_dict(),
             self._deformation_table,
             # self.grid,
@@ -89,7 +91,8 @@ class GaussianModel:
     
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
-        self._xyz, 
+        self._xyz,
+        self._dynamic_xyz,
         deform_state,
         self._deformation_table,
         
@@ -105,10 +108,11 @@ class GaussianModel:
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self._deformation.load_state_dict(deform_state)
-        self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        if training_args is not None:
+            self.training_setup(training_args)
+            self.xyz_gradient_accum = xyz_gradient_accum
+            self.denom = denom
+            self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_scaling(self):
@@ -121,6 +125,10 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    @property
+    def get_dynamic_xyz(self):
+        return self._xyz[self._dynamic_xyz]
 
     @property
     def get_features(self):
@@ -158,6 +166,7 @@ class GaussianModel:
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._dynamic_xyz = torch.zeros(self._xyz.shape[0]).type(torch.bool).to(self._xyz.device)
         self._deformation = self._deformation.to("cuda") 
         # self.grid = self.grid.to("cuda")
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -167,13 +176,21 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+
+    def erase_non_dynamic_grads(self):
+        self._xyz.grad[~self._dynamic_xyz] *= 0
+        self._features_dc.grad[~self._dynamic_xyz] *= 0
+        self._features_rest.grad[~self._dynamic_xyz] *= 0
+        self._opacity.grad[~self._dynamic_xyz] *= 0
+        self._scaling.grad[~self._dynamic_xyz] *= 0
+        self._rotation.grad[~self._dynamic_xyz] *= 0
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
         
-
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
@@ -183,6 +200,39 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            
+        ]
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
+                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=training_args.position_lr_max_steps)
+        self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
+                                                    lr_final=training_args.deformation_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
+                                                    max_steps=training_args.position_lr_max_steps)    
+        self.grid_scheduler_args = get_expon_lr_func(lr_init=training_args.grid_lr_init*self.spatial_lr_scale,
+                                                    lr_final=training_args.grid_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
+                                                    max_steps=training_args.position_lr_max_steps)    
+
+    def static_background_training_setup(self, training_args):
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
+        
+
+        l = [
+            {'params': [self._xyz[self._dynamic_xyz]], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
+            {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale, "name": "grid"},
+            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._opacity[self._dynamic_xyz]], 'lr': training_args.opacity_lr, "name": "opacity"},
+            {'params': [self._scaling[self._dynamic_xyz]], 'lr': training_args.scaling_lr, "name": "scaling"},
+            {'params': [self._rotation[self._dynamic_xyz]], 'lr': training_args.rotation_lr, "name": "rotation"}
             
         ]
 
@@ -313,6 +363,7 @@ class GaussianModel:
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._dynamic_xyz = torch.zeros(self._xyz.shape[0]).type(torch.bool).to(self._xyz.device)
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -360,6 +411,7 @@ class GaussianModel:
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
+        self._dynamic_xyz = self._dynamic_xyz[valid_points_mask.to(self._dynamic_xyz.device)]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
@@ -394,7 +446,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table):
+    def densification_postfix(self, new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -406,6 +458,7 @@ class GaussianModel:
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
+        self._dynamic_xyz = torch.cat((self._dynamic_xyz, new_dynamic_xyz.to(self._dynamic_xyz.device) ), -1)
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
@@ -436,13 +489,14 @@ class GaussianModel:
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_dynamic_xyz = self._dynamic_xyz[selected_pts_mask].repeat(N)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table)
+        self.densification_postfix(new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -475,6 +529,7 @@ class GaussianModel:
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         # breakpoint()        
         new_xyz = self._xyz[selected_pts_mask] 
+        new_dynamic_xyz = self._dynamic_xyz[selected_pts_mask.to(self._dynamic_xyz.device)]
         # - 0.001 * self._xyz.grad[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -484,7 +539,7 @@ class GaussianModel:
         new_deformation_table = self._deformation_table[selected_pts_mask]
         # if opt.add_point:
         # selected_xyz, grow_xyz = self.add_point_by_mask(selected_pts_mask_grow.to(self.get_xyz.device), self.displacement_scale)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+        self.densification_postfix(new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
         # print("被动增加点云：",selected_xyz.shape[0])
         # print("主动增加点云：",selected_pts_mask.sum())
         # if model_path is not None and iteration is not None:
@@ -493,6 +548,22 @@ class GaussianModel:
         #     os.makedirs(write_path,exist_ok=True)
         #     o3d.io.write_point_cloud(os.path.join(write_path,f"iteration_{stage}{iteration}.ply"),point)
         #     print("write output.")
+
+    def spawn_dynamic_gaussians(self, selected_pts_mask=None):
+        if selected_pts_mask is None:
+            selected_pts_mask = torch.rand(self._xyz.shape[0]) < 0.3
+        else:
+            assert ( len(selected_pts_mask) == self._xyz.shape[0] )
+        new_xyz = self._xyz[selected_pts_mask]
+        new_dynamic_xyz = torch.ones(selected_pts_mask.sum().item()).type(torch.bool) #mark as dynamic
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+        new_deformation_table = self._deformation_table[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+    
     @property
     def get_aabb(self):
         return self._deformation.get_aabb
@@ -524,6 +595,7 @@ class GaussianModel:
 
         # new_xyz = selected_xyz + displacements
         # - 0.001 * self._xyz.grad[selected_pts_mask]
+        new_dynamic_xyz = self._dynamic_xyz[selected_pts_mask][mask]
         new_features_dc = self._features_dc[selected_pts_mask][mask]
         new_features_rest = self._features_rest[selected_pts_mask][mask]
         new_opacities = self._opacity[selected_pts_mask][mask]
@@ -532,7 +604,7 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask][mask]
         new_deformation_table = self._deformation_table[selected_pts_mask][mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+        self.densification_postfix(new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
         return selected_xyz, new_xyz
     def downsample_point(self, point_cloud):
         if not hasattr(self,"voxel_size"):

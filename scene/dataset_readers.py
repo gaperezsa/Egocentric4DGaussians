@@ -41,8 +41,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     depth_image: np.array
     depth_path: str
-    segmentation : np.array
-    bounding_box_mask: np.array
+    dynamic_mask: torch.tensor
     width: int
     height: int
     time : float
@@ -51,7 +50,6 @@ class CameraInfo(NamedTuple):
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
-    close_train_cameras: list
     test_cameras: list
     video_cameras: list
     nerf_normalization: dict
@@ -126,32 +124,20 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         
         depth_path = image_path.split("colmap")[0] + "depth/" + image_name.replace("camera_rgb","camera_depth") + ".png"
         #segmentation_path = image_path.split("colmap")[0] + "segmentation/" + image_name.replace("camera_rgb","camera_segmentation") + ".npy"
-        #bounding_box_path = image_path.split("colmap")[0] + "bounding_boxes/" + image_name.replace("camera_rgb","bounding_box") + ".npy"
+        dynamic_masks_path = image_path.split("colmap")[0] + "dynamic_masks/" + image_name.replace("camera_rgb","camera_dynamics") + ".npy"
+
+        depth_image = None
         if os.path.isfile(depth_path):
             depth_image = Image.open(depth_path)
             depth_image = torch.from_numpy((np.array(depth_image).astype(np.float32))/1000) #mm to meters
+        
+        dynamic_mask = None
+        if os.path.isfile(dynamic_masks_path):
+            dynamic_mask = torch.from_numpy(np.load(dynamic_masks_path)).type(torch.bool)
             
-            segmentation = None
-            #if os.path.isfile(segmentation_path):
-            #    segmentation = np.load(segmentation_path)
-            #else:
-            #    segmentation = None
-            
-            bounding_box_mask = None
-            #if os.path.isfile(bounding_box_path):
-            #    bounding_box_mask = np.load(bounding_box_path).astype(bool)
-            #else:
-            #    bounding_box_mask = None
-            
-            
-            cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                    image_path=image_path, image_name=image_name, depth_image=depth_image, depth_path=depth_path, segmentation=segmentation, bounding_box_mask=bounding_box_mask,  width=width, height=height,
-                                    time = float(idx/len(cam_extrinsics)), mask=None)
-            
-        else:
-            cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                 image_path=image_path, image_name=image_name, depth_image=None, depth_path=None, segmentation=None, bounding_box_mask=None, width=width, height=height,
-                                time = float(idx/len(cam_extrinsics)), mask=None) # default by monocular settings.
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                image_path=image_path, image_name=image_name, depth_image=depth_image, depth_path=depth_path, dynamic_mask=dynamic_mask,  width=width, height=height,
+                                time = float(idx/len(cam_extrinsics)), mask=None)
             
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
@@ -200,7 +186,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        close_train_cam_infos = [c for c in train_cam_infos if (c.depth_image < 1.0).sum().item() > c.depth_image.nelement() * 0.05]
+        #close_train_cam_infos = [c for c in train_cam_infos if (c.depth_image < 1.0).sum().item() > c.depth_image.nelement() * 0.05]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
@@ -227,7 +213,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
-                           close_train_cameras = close_train_cam_infos,
+                           #close_train_cameras = close_train_cam_infos,
                            test_cameras=test_cam_infos,
                            video_cameras=train_cam_infos,
                            maxtime=0,

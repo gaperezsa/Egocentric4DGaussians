@@ -304,3 +304,338 @@ def render_dynamic_compare(viewpoint_camera, pc : GaussianModel, pipe, bg_color 
     pc.capture_visible_positions(means3D_final, radii > 0)
 
     return per_gaussian_valid_dynamic_movement
+
+
+def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_opacity = None, stage = "fine", cam_type = None):
+    """
+    Render the scene. 
+    
+    Background tensor (bg_color) must be on GPU!
+    """
+ 
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Set up rasterization configuration
+    
+    means3D = pc.get_xyz
+    if hasattr(pc,"_dynamic_xyz"):
+        dynamic_gaussians_mask = pc._dynamic_xyz
+
+    if cam_type != "PanopticSports":
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform.cuda(),
+            projmatrix=viewpoint_camera.full_proj_transform.cuda(),
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center.cuda(),
+            prefiltered=False,
+            debug=pipe.debug
+        )
+
+        if dynamic_gaussians_mask.sum().item() > 1:
+            time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D[dynamic_gaussians_mask].shape[0],1)
+        else:
+            time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
+    else:
+        raster_settings = viewpoint_camera['camera']
+        time=torch.tensor(viewpoint_camera['time']).to(means3D.device).repeat(means3D.shape[0],1)
+        
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    # means3D = pc.get_xyz
+    # add deformation to each points
+    # deformation = pc.get_deformation
+
+    means2D = screenspace_points
+    opacity = pc._opacity
+    shs = pc.get_features
+    dynamic_movement_loss = None
+    out_of_frame_stillness_loss = None
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc._scaling
+        rotations = pc._rotation
+
+
+    if hasattr(pc,"_dynamic_xyz") and dynamic_gaussians_mask.sum().item() > 1:
+
+        # Perform deformation on the selected indices
+        (
+            means3D_deformed,
+            scales_deformed,
+            rotations_deformed,
+            opacity_deformed,
+            shs_deformed
+        ) = pc._deformation(
+            means3D[dynamic_gaussians_mask],
+            scales[dynamic_gaussians_mask],
+            rotations[dynamic_gaussians_mask],
+            opacity[dynamic_gaussians_mask],
+            shs[dynamic_gaussians_mask],
+            time
+        )
+
+        # Initialize final tensors
+        means3D_final = torch.empty_like(means3D)
+        scales_final = torch.empty_like(scales)
+        rotations_final = torch.empty_like(rotations)
+        opacity_final = torch.empty_like(opacity)
+        shs_final = torch.empty_like(shs)
+
+        # Assign deformed values
+        means3D_final[dynamic_gaussians_mask] = means3D_deformed
+        scales_final[dynamic_gaussians_mask] = scales_deformed
+        rotations_final[dynamic_gaussians_mask] = rotations_deformed
+        opacity_final[dynamic_gaussians_mask] = opacity_deformed
+        shs_final[dynamic_gaussians_mask] = shs_deformed
+
+        # Assign original values to the rest
+        means3D_final[~dynamic_gaussians_mask] = means3D[~dynamic_gaussians_mask]
+        scales_final[~dynamic_gaussians_mask] = scales[~dynamic_gaussians_mask]
+        rotations_final[~dynamic_gaussians_mask] = rotations[~dynamic_gaussians_mask]
+        opacity_final[~dynamic_gaussians_mask] = opacity[~dynamic_gaussians_mask]
+        shs_final[~dynamic_gaussians_mask] = shs[~dynamic_gaussians_mask]
+
+    else:
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+
+
+
+    scales_final = pc.scaling_activation(scales_final)
+    rotations_final = pc.rotation_activation(rotations_final)
+    opacity_final = pc.opacity_activation(opacity_final)
+    colors_precomp = None
+
+    if override_color is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        else:
+            pass
+    else:
+        shs_final = None
+        colors_precomp = override_color
+
+    if override_opacity is not None:
+        assert(override_opacity.shape == opacity_final.shape)
+        opacity_final = override_opacity
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # time3 = get_time()
+    rendered_image, radii, depth = rasterizer(
+        means3D = means3D_final,
+        means2D = means2D,
+        shs = shs_final,
+        colors_precomp = colors_precomp,
+        opacities = opacity_final,
+        scales = scales_final,
+        rotations = rotations_final,
+        cov3D_precomp = cov3D_precomp)
+    
+    dynamic_only_splat = None
+    if dynamic_gaussians_mask.sum().item() > 1:
+        if cov3D_precomp is not None:
+            dynamic_cov3D_precomp = cov3D_precomp[dynamic_gaussians_mask]
+        else:
+            dynamic_cov3D_precomp = None
+
+        if stage != "background_depth":
+            dynamic_only_splat, dynamic_only_radii, _ = rasterizer(
+                means3D = means3D_final[dynamic_gaussians_mask],
+                means2D = means2D[dynamic_gaussians_mask],
+                shs = None,
+                colors_precomp = 1 - bg_color.repeat(pc._dynamic_xyz.sum().item(),1),
+                opacities = opacity_final[dynamic_gaussians_mask],
+                scales = scales_final[dynamic_gaussians_mask],
+                rotations = rotations_final[dynamic_gaussians_mask],
+                cov3D_precomp = dynamic_cov3D_precomp)
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+       
+    return {"render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter" : radii > 0,
+            "radii": radii,
+            "depth":depth,
+            "dynamic_only_splat": dynamic_only_splat,
+            "dynamic_only_visibility_filter": dynamic_only_splat
+            }
+
+
+
+def render_dynamic_gaussians_mask_and_compare(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
+    """
+    Render the scene. 
+    
+    Background tensor (bg_color) must be on GPU!
+    """
+ 
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=False, device="cuda") + 0
+
+
+    # Set up rasterization configuration
+    
+    means3D = pc.get_xyz
+
+    if hasattr(pc,"_dynamic_xyz"):
+        dynamic_gaussians_mask = pc._dynamic_xyz
+        
+    if cam_type != "PanopticSports":
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform.cuda(),
+            projmatrix=viewpoint_camera.full_proj_transform.cuda(),
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center.cuda(),
+            prefiltered=False,
+            debug=pipe.debug
+        )
+        if dynamic_gaussians_mask.sum().item() > 1:
+            time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D[dynamic_gaussians_mask].shape[0],1)
+        else:
+            time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
+    else:
+        raster_settings = viewpoint_camera['camera']
+        time=torch.tensor(viewpoint_camera['time']).to(means3D.device).repeat(means3D.shape[0],1)
+        
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    means2D = screenspace_points
+    opacity = pc._opacity
+    shs = pc.get_features
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc._scaling
+        rotations = pc._rotation
+
+
+    if hasattr(pc,"_dynamic_xyz") and dynamic_gaussians_mask.sum().item() > 1:
+
+        # Perform deformation on the selected indices
+        (
+            means3D_deformed,
+            scales_deformed,
+            rotations_deformed,
+            opacity_deformed,
+            shs_deformed
+        ) = pc._deformation(
+            means3D[dynamic_gaussians_mask],
+            scales[dynamic_gaussians_mask],
+            rotations[dynamic_gaussians_mask],
+            opacity[dynamic_gaussians_mask],
+            shs[dynamic_gaussians_mask],
+            time
+        )
+
+        # Initialize final tensors
+        means3D_final = torch.empty_like(means3D)
+        scales_final = torch.empty_like(scales)
+        rotations_final = torch.empty_like(rotations)
+        opacity_final = torch.empty_like(opacity)
+        shs_final = torch.empty_like(shs)
+
+        # Assign deformed values
+        means3D_final[dynamic_gaussians_mask] = means3D_deformed
+        scales_final[dynamic_gaussians_mask] = scales_deformed
+        rotations_final[dynamic_gaussians_mask] = rotations_deformed
+        opacity_final[dynamic_gaussians_mask] = opacity_deformed
+        shs_final[dynamic_gaussians_mask] = shs_deformed
+
+        # Assign original values to the rest
+        means3D_final[~dynamic_gaussians_mask] = means3D[~dynamic_gaussians_mask]
+        scales_final[~dynamic_gaussians_mask] = scales[~dynamic_gaussians_mask]
+        rotations_final[~dynamic_gaussians_mask] = rotations[~dynamic_gaussians_mask]
+        opacity_final[~dynamic_gaussians_mask] = opacity[~dynamic_gaussians_mask]
+        shs_final[~dynamic_gaussians_mask] = shs[~dynamic_gaussians_mask]
+
+    else:
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+
+
+    scales_final = pc.scaling_activation(scales_final)
+    rotations_final = pc.rotation_activation(rotations_final)
+    opacity_final = pc.opacity_activation(opacity_final)
+
+    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    # shs = None
+    colors_precomp = None
+    if override_color is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        else:
+            pass
+            # shs = 
+    else:
+        colors_precomp = override_color
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # time3 = get_time()
+    rendered_image, radii, depth = rasterizer(
+        means3D = means3D_final,
+        means2D = means2D,
+        shs = shs_final,
+        colors_precomp = colors_precomp,
+        opacities = opacity_final,
+        scales = scales_final,
+        rotations = rotations_final,
+        cov3D_precomp = cov3D_precomp)
+    # time4 = get_time()
+    # print("rasterization:",time4-time3)
+
+    per_gaussian_valid_dynamic_movement = torch.zeros(means3D_final.shape[0])
+
+    if hasattr(pc,"previous_visibility"):
+        #continuous_visibility_filter = torch.tensor([(a and b).item() for a, b in zip(pc.previous_visibility.detach().cpu(), (radii > 0).detach().cpu())])
+        #per_gaussian_valid_dynamic_movement = torch.sqrt(torch.sum(torch.pow(torch.subtract(means3D_final, pc.previous_positions), 2), dim=1)).detach().cpu()*continuous_visibility_filter
+        # Keep everything on the GPU
+        continuous_visibility_filter = (pc.previous_visibility & (radii > 0)).float()
+
+        # Compute the per-Gaussian valid dynamic movement directly on GPU
+        per_gaussian_valid_dynamic_movement = torch.sqrt(torch.sum((means3D_final - pc.previous_positions) ** 2, dim=1)) * continuous_visibility_filter
+
+    pc.capture_visible_positions(means3D_final, radii > 0)
+
+    return per_gaussian_valid_dynamic_movement

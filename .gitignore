@@ -2,6 +2,7 @@
 .vscode
 output
 old_output
+old_output2
 build
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
@@ -11,6 +12,5 @@ data/
 data
 raw_ADT_data/
 exploring_ADT_data/
-submodules/
 wandb/
 debugging*

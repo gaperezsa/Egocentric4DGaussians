@@ -91,4 +91,4 @@ def create_subset(data_dir, start_frame, end_frame):
     print(f"Subset created in {output_dir}")
 
 # Usage example
-create_subset("/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/data/ADT/NewApartmentMealSeq137M1292", 270971045579125, 271017371495125)
+create_subset("/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/data/ADT/NewApartmentMealSeq137M1292", 271000307556625, 271013838726212)

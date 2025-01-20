@@ -70,8 +70,8 @@ class Scene:
         self.cameras_extent = scene_info.nerf_normalization["radius"]
         print("Loading Training Cameras")
         self.train_camera = FourDGSdataset(scene_info.train_cameras, args, dataset_type)
-        print("Loading Training Cameras")
-        self.close_train_camera = FourDGSdataset(scene_info.close_train_cameras, args, dataset_type)
+        #print("Loading Training Cameras")
+        #self.close_train_camera = FourDGSdataset(scene_info.close_train_cameras, args, dataset_type)
         print("Loading Test Cameras")
         self.test_camera = FourDGSdataset(scene_info.test_cameras, args, dataset_type)
         print("Loading Video Cameras")
@@ -88,11 +88,11 @@ class Scene:
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
-                                                           "coarse_iteration_" + str(self.loaded_iter),
+                                                           "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
             self.gaussians.load_model(os.path.join(self.model_path,
                                                     "point_cloud",
-                                                    "coarse_iteration_" + str(self.loaded_iter),
+                                                    "iteration_" + str(self.loaded_iter),
                                                    ))
         else:
             if init_random_pcd:
