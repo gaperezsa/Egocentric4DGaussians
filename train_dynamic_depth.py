@@ -13,7 +13,7 @@ import random
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss,l1_filtered_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss, dice_loss
+from utils.loss_utils import l1_loss,l1_filtered_loss, l1_filtered_depth_valid_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss, dice_loss
 from gaussian_renderer import render, network_gui, render_with_dynamic_gaussians_mask, render_dynamic_gaussians_mask_and_compare
 from render import render_set_no_compression
 from metrics import evaluate_single_folder
@@ -267,13 +267,13 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             gt_dynamic_masks_tensor = torch.cat(gt_dynamic_masks,0)
             
             if stage == "background_depth":
-                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
+                depth_loss = l1_filtered_depth_valid_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
                 loss = Ll1 + (hyper.general_depth_weight * depth_loss)
             
             else:
                 dynamic_masks_tensor = torch.cat(dynamic_masks,0)
                 depth_loss = l1_loss(depth_image_tensor, gt_depth_image_tensor)
-                torchvision.utils.save_image(luminance_thresholded.float(), "/home/gperezsantamaria/gperezsantamaria_2/Egocentric4DGaussians/output/debug/dyn_splat_debug.png")
+                torchvision.utils.save_image(luminance_thresholded.float(), f"output/"+args.expname+"/dyn_splat_debug.png")
                 dynamic_splat_loss = dice_loss(dynamic_masks_tensor, gt_dynamic_masks_tensor)
                 #dynamic_splat_loss = dynamic_splatting_loss(dynamic_masks_tensor.float(), gt_dynamic_masks_tensor.float())
                 loss = Ll1 + (hyper.general_depth_weight * depth_loss) + 5 * dynamic_splat_loss
@@ -331,7 +331,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
             # Log and save
             timer.pause()
-            training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_dynamic_gaussians_mask_and_compare, [pipe, background], stage, scene.dataset_type)
+            training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_with_dynamic_gaussians_mask, [pipe, background], stage, scene.dataset_type)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)

@@ -30,6 +30,11 @@ def l1_proximity_loss(network_output, gt, max=1):
 def l1_filtered_loss(network_output, gt, filter):
     return torch.abs((network_output[filter] - gt[filter])).mean()
 
+def l1_filtered_depth_valid_loss(network_output, gt, filter):
+    valid_depth = gt > 0.001
+    valid_filter = torch.logical_and(filter,valid_depth)
+    return torch.abs((network_output[valid_filter] - gt[valid_filter])).mean()
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 

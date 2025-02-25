@@ -208,4 +208,3 @@ dependencies:
     - widgetsnbextension==4.0.10
     - yapf==0.40.2
     - zipp==3.18.1
-prefix: /home/gperezsantamaria/anaconda3/envs/Gaussians4D

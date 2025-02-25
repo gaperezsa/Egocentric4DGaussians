@@ -2,6 +2,7 @@ import torch
 import os
 from PIL import Image, ImageDraw, ImageFont
 from matplotlib import pyplot as plt
+import matplotlib.cm as cm
 plt.rcParams['font.sans-serif'] = ['Times New Roman']
 
 import numpy as np
@@ -21,22 +22,27 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
         label2 = "time:%.2f" % times + end
         image = render_pkg["render"]
         depth = render_pkg["depth"]
+        gt_depth = viewpoint.depth_image.cpu().unsqueeze(2).numpy()
         if dataset_type == "PanopticSports":
             gt_np = viewpoint['image'].permute(1,2,0).cpu().numpy()
         else:
             gt_np = viewpoint.original_image.permute(1,2,0).cpu().numpy()
         image_np = image.permute(1, 2, 0).cpu().numpy()  # 转换通道顺序为 (H, W, 3)
+        
         depth_np = depth.permute(1, 2, 0).cpu().numpy()
         depth_np /= depth_np.max()
         depth_np = np.repeat(depth_np, 3, axis=2)
+
+        gt_depth_norm = gt_depth/gt_depth.max()
+        gt_depth_norm = np.repeat(gt_depth_norm, 3, axis=2)
          
         # Aria rotated images fixing
-        gt_np = np.rot90(gt_np,k=3,axes=(0,1))
-        image_np = np.rot90(image_np,k=3,axes=(0,1))
-        depth_np = np.rot90(depth_np,k=3,axes=(0,1))
+        #gt_np = np.rot90(gt_np,k=3,axes=(0,1))
+        #image_np = np.rot90(image_np,k=3,axes=(0,1))
+        #depth_np = np.rot90(depth_np,k=3,axes=(0,1))
 
 
-        image_np = np.concatenate((gt_np, image_np, depth_np), axis=1)
+        image_np = np.concatenate((gt_np, image_np, depth_np,gt_depth_norm), axis=1)
         image_with_labels = Image.fromarray((np.clip(image_np,0,1) * 255).astype('uint8'))  # 转换为8位图像
         # 创建PIL图像对象的副本以绘制标签
         draw1 = ImageDraw.Draw(image_with_labels)

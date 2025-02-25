@@ -94,11 +94,21 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         width = intr.width
 
         uid = intr.id
-        #R = np.transpose(qvec2rotmat(extr.qvec))
-        #degrees_90_x_rot = np.array([[1,0,0],[0,-1,0],[0,0,1]])
-        R = np.array(qvec2rotmat(extr.qvec))
-        #R = np.matmul(R,degrees_90_x_rot)
+
+        # For HOI4D extrinsics
+        R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
+        M = np.diag([-1, -1, -1])
+        
+        # Apply the necessary HOI4D transformation:
+        R = M @ R @ M
+        T = M @ T
+
+        # For ADT extrinsics
+        # R = np.array(qvec2rotmat(extr.qvec))
+        # T = np.array(extr.tvec)
+
+        
 
         if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL"]:
             focal_length_x = intr.params[0]
@@ -118,12 +128,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        try:
+            image = Image.open(image_path)
+        except:
+            expanded_name = "camera_rgb_" + os.path.basename(extr.name).replace("png","jpg")
+            image_path = os.path.join(images_folder, expanded_name)
+            image = Image.open(image_path)
+
         image = PILtoTorch(image,None)
-        
+        image_name = os.path.basename(image_path).split(".")[0]
         depth_path = image_path.split("colmap")[0] + "depth/" + image_name.replace("camera_rgb","camera_depth") + ".png"
-        #segmentation_path = image_path.split("colmap")[0] + "segmentation/" + image_name.replace("camera_rgb","camera_segmentation") + ".npy"
         dynamic_masks_path = image_path.split("colmap")[0] + "dynamic_masks/" + image_name.replace("camera_rgb","camera_dynamics") + ".npy"
 
         depth_image = None
@@ -180,7 +194,6 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
-
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
