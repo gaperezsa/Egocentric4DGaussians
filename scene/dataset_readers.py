@@ -98,11 +98,6 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         # For HOI4D extrinsics
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
-        M = np.diag([-1, -1, -1])
-        
-        # Apply the necessary HOI4D transformation:
-        R = M @ R @ M
-        T = M @ T
 
         # For ADT extrinsics
         # R = np.array(qvec2rotmat(extr.qvec))
@@ -206,7 +201,6 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
-
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")

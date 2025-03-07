@@ -121,7 +121,6 @@ class HexPlaneField(nn.Module):
         self.grid_config =  [planeconfig]
         self.multiscale_res_multipliers = multires
         self.concat_features = True
-
         # 1. Init planes
         self.grids = nn.ModuleList()
         self.feat_dim = 0

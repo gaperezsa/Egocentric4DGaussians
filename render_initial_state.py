@@ -4,7 +4,7 @@ import os, sys
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, render_with_dynamic_gaussians_mask,  network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -64,18 +64,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, checkpoint, gaussians, scene
     viewpoint_stack = scene.getTrainCameras()
     viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,num_workers=0,collate_fn=list)
     print("data loading done")
-    iteration = 0
     for i, viewpoint_cam in enumerate(viewpoint_stack_loader):    
-        if i >= 400:
-            break
-        if i < 200:
-            continue
 
-        render_training_image(scene, gaussians, viewpoint_cam, render, pipe, background, stage, i,timer.get_elapsed_time(),scene.dataset_type)
+        render_training_image(scene, gaussians, viewpoint_cam, render_with_dynamic_gaussians_mask, pipe, background, stage, i,timer.get_elapsed_time(),scene.dataset_type)
         
-
-
-
 def render_initial_state(dataset, hyper, opt, pipe, expname, args):
     # first_iter = 0
     prepare_output(expname)

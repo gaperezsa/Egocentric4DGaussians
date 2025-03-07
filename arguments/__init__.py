@@ -88,8 +88,8 @@ class ModelHiddenParams(ParamGroup):
         self.kplanes_config = {
                              'grid_dimensions': 2,
                              'input_coordinate_dim': 4,
-                             'output_coordinate_dim': 32,
-                             'resolution': [64, 64, 64, 25]
+                             'output_coordinate_dim': 16,
+                             'resolution': [64, 64, 64, 150]
                             }
         self.multires = [1, 2, 4, 8]
         self.no_dx=False

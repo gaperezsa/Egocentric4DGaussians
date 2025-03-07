@@ -70,7 +70,8 @@ def mae(render, gt):
     Returns:
         float: MAE value.
     """
-    return torch.abs(render - gt).mean().item()
+    valid_mask = gt > 0.001
+    return torch.abs(render[valid_mask] - gt[valid_mask]).mean().item()
 
 def rel_error(render, gt):
     """

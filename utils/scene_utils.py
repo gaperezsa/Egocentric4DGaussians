@@ -23,6 +23,8 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
         image = render_pkg["render"]
         depth = render_pkg["depth"]
         gt_depth = viewpoint.depth_image.cpu().unsqueeze(2).numpy()
+        if iteration ==28:
+            breakpoint()
         if dataset_type == "PanopticSports":
             gt_np = viewpoint['image'].permute(1,2,0).cpu().numpy()
         else:

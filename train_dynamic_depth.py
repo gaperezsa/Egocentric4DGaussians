@@ -254,8 +254,8 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             gt_image_tensor = torch.cat(gt_images,0)
         
         # Loss
-        Ll1 = 0
-        Depth_loss = 0
+        Ll1 = torch.tensor(0)
+        Depth_loss = torch.tensor(0)
 
         if not depth_only_stage:
             Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
@@ -338,8 +338,8 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             if dataset.render_process:
                 if (iteration < 1000 and iteration % 50 == 1) \
                     or (iteration < 3000 and iteration % 100 == 99) \
-                        or (iteration < 60000 and iteration %  500 == 499) \
-                            or (iteration < 200000 and iteration %  1000 == 999) :
+                        or (iteration < 60000 and iteration %  1000 == 999) \
+                            or (iteration < 200000 and iteration %  2000 == 1999) :
                             # breakpoint()
                             render_training_image(scene, gaussians, [test_cams[500%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_train_", iteration,timer.get_elapsed_time(),scene.dataset_type)
                             render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
@@ -497,7 +497,7 @@ def prepare_output_and_logger(expname):
 def training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
     if tb_writer:
         tb_writer.add_scalar(f'{stage}/train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar(f'{stage}/train_loss_patchestotal_loss', loss.item(), iteration)
+        tb_writer.add_scalar(f'{stage}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{stage}/iter_time', elapsed, iteration)
     if using_wandb:
         wandb.log({f'{stage}/train_loss_patches/l1_loss': Ll1.item(), f'{stage}/train_loss_patches/total_loss': loss.item(), f'{stage}/iter_time' : elapsed})
@@ -590,7 +590,7 @@ if __name__ == "__main__":
     parser.add_argument('--general_depth_weight', type=float, default=0.5)
     
     #Which training pipeline, 0 is regular, 1 is with general depth and close depth, 2 is probabilistic paralel depth
-    parser.add_argument('--training_mode', type=int, default=0)
+    parser.add_argument('--training_mode', type=int, default=1)
 
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
@@ -617,17 +617,26 @@ if __name__ == "__main__":
 
     if args.wandb:
         print("intializing Weights and Biases...")
-        wandb.init(
-            # set the wandb project where this run will be logged
-            project="4DGaussians",
+        wandb.init()
+        config = wandb.config
+        # Define your experiment name template (you can also hardcode it here or pass it via the config)
+        name_template = "exp_ci{coarse_iter}_fi{fine_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
 
-            # track hyperparameters and run metadata
-            config={
-            "experiment_name" : args.expname,
-            "coarse iterations": args.coarse_iter,
-            "fine iterations": args.fine_iter,
-            }
+        # Generate the experiment name using the hyperparameters from the sweep
+        experiment_name = name_template.format(
+            coarse_iter=config.coarse_iter,
+            fine_iter=config.fine_iter,
+            defor_depth=config.defor_depth,
+            net_width=config.net_width,
+            grid_lr_init=config.grid_lr_init,
         )
+
+        # Optionally, update the run name in wandb
+        wandb.run.name = experiment_name
+
+        args.expname = experiment_name
+
+        print("Experiment Name:", experiment_name)
 
     # Initialize system state (RNG)
     #safe_state(args.quiet)
@@ -645,6 +654,8 @@ if __name__ == "__main__":
     op_params.batch_size =  args.bs
 
     hp_params = hp.extract(args)
+    if type(hp_params.multires) == type(list()) and type(hp_params.multires[0]) == type(str()):
+        hp_params.multires = [int(x) for x in hp_params.multires]
     hp_params.net_width =  args.netork_width
     hp_params.general_depth_weight = args.general_depth_weight
     
