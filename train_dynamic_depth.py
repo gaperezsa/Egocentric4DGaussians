@@ -13,7 +13,7 @@ import random
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss,l1_filtered_loss, l1_filtered_depth_valid_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss, dice_loss
+from utils.loss_utils import l1_loss,l1_filtered_loss, log_depth_loss, log_filtered_depth_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss, iou_loss, recall_loss, chamfer_loss
 from gaussian_renderer import render, network_gui, render_with_dynamic_gaussians_mask, render_dynamic_gaussians_mask_and_compare
 from render import render_set_no_compression
 from metrics import evaluate_single_folder
@@ -64,7 +64,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
     gaussians.training_setup(opt)
 
     depth_only_stage = stage=="background_depth" or stage=="dynamics_depth"
-
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -193,29 +192,41 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             
         images = []
         depth_images = []
-        dynamic_masks = []
+        dynamic_depth = []
+        dynamic_image = []
+        dynamic_point_cloud = []
         gt_images = []
         gt_depth_images = []
         gt_dynamic_masks = []
+        gt_dynamic_point_cloud = []
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
+        
         for viewpoint_cam in viewpoint_cams:
+
             
             # Check if depth available
             if  viewpoint_cam.depth_image is None and stage != "close_dynamics":
                 continue
             
             # Render and extract
-            render_pkg = render_with_dynamic_gaussians_mask(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
-            image, depth_image, viewspace_point_tensor, visibility_filter, radii, dynamic_splat = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["dynamic_only_splat"]
+            if stage != "fine_coloring":
+                render_pkg = render_with_dynamic_gaussians_mask(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=True)
+            else:
+                render_pkg = render_with_dynamic_gaussians_mask(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=False)
+
+            image, depth_image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             
             # Should we retrieve gt RGB?
-            if not depth_only_stage:
+            if stage == "background_RGB" or stage == "dynamics_RGB" or stage == "fine_coloring":
                 if scene.dataset_type!="PanopticSports":
                     gt_image = viewpoint_cam.original_image.cuda()
                 else:
                     gt_image  = viewpoint_cam['image'].cuda()
+                
+                images.append(image.unsqueeze(0))
+                gt_images.append(gt_image.unsqueeze(0))
 
             # Does gt depth exist?
             if  viewpoint_cam.depth_image is not None:
@@ -228,73 +239,83 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             else:
                 gt_depth_image  = viewpoint_cam.depth_image.cuda()
 
-            # Get corresponding gt dynamic_mask if dynamic gaussians were splatted
-            # Convert dynamic gaussian splat to boolean array by luminance thresholding
+            # Get the corresponding dynamic mask
             gt_dynamic_mask = viewpoint_cam.dynamic_mask.cuda()
-            if dynamic_splat is not None:
-                luminance_thresholded = (0.2126 * dynamic_splat[0, :, :] + 0.7152 * dynamic_splat[1, :, :] + 0.0722 * dynamic_splat[2, :, :] < 0.1).cuda() 
-                
-            # Append rendered assets and corresponding gt
-            if not depth_only_stage:
-                images.append(image.unsqueeze(0))
-                gt_images.append(gt_image.unsqueeze(0))
+            gt_dynamic_masks.append(gt_dynamic_mask.unsqueeze(0))
+
+            # Pair the predicted depth and gt depth
             depth_images.append(depth_image.squeeze().unsqueeze(0))
             gt_depth_images.append(gt_depth_image.unsqueeze(0))
-            if dynamic_splat is not None:
-                dynamic_masks.append(luminance_thresholded.unsqueeze(0))
-            gt_dynamic_masks.append(gt_dynamic_mask.unsqueeze(0))
+
+            # If we have dynamic only splat and depth, then we are in a stage that requires dynamic depth
+            if render_pkg["dynamic_only_render"] is not None and render_pkg["dynamic_only_depth"] is not None:
+                dynamic_image.append(render_pkg["dynamic_only_render"].unsqueeze(0))
+                dynamic_depth.append(render_pkg["dynamic_only_depth"].squeeze().unsqueeze(0))
+
+                dynamic_point_cloud.append(render_pkg["dynamic_3D_means"].squeeze().cuda())
+                gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
+                
+
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
             
         radii = torch.cat(radii_list,0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
-        if not depth_only_stage:
-            image_tensor = torch.cat(images,0)
-            gt_image_tensor = torch.cat(gt_images,0)
         
         # Loss
         Ll1 = torch.tensor(0)
-        Depth_loss = torch.tensor(0)
+        depth_loss = torch.tensor(0)
+        dynamic_mask_loss = torch.tensor(0)
 
-        if not depth_only_stage:
-            Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
+        gt_dynamic_masks_tensor = torch.cat(gt_dynamic_masks,0)
+        image_tensor = torch.cat(images,0)
+        gt_image_tensor = torch.cat(gt_images,0)
+        
+        # In this stages, the RGB loss do not require depth
+        if stage == "background_RGB" or stage == "dynamics_RGB" or stage == "fine_coloring":
+            image_tensor = torch.cat(images,0)
+            gt_image_tensor = torch.cat(gt_images,0)
+            if stage == "background_RGB":
+                mask = (~gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
+                Ll1 = l1_filtered_loss(image_tensor, gt_image_tensor[:,:3,:,:], mask)
+            elif stage == "dynamics_RGB":
+                mask = (gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
+                dynamic_image_tensor = torch.cat(dynamic_image,0)
+                Ll1 = l1_filtered_loss(dynamic_image_tensor, gt_image_tensor[:,:3,:,:], mask)
+            elif stage == "fine_coloring":
+                Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
 
-        if len(gt_depth_images) > 0 and stage != "close_dynamics":
+        # If depth pairings exist, then for each stage we compute losses that need them
+        if len(gt_depth_images) > 0 :
             depth_image_tensor = torch.cat(depth_images,0)
             gt_depth_image_tensor = torch.cat(gt_depth_images,0)
-
-            gt_dynamic_masks_tensor = torch.cat(gt_dynamic_masks,0)
-            
             if stage == "background_depth":
-                depth_loss = l1_filtered_depth_valid_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
-                loss = Ll1 + (hyper.general_depth_weight * depth_loss)
-            
-            else:
-                dynamic_masks_tensor = torch.cat(dynamic_masks,0)
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
+            elif stage == "background_RGB":
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
+                depth_loss = hyper.general_depth_weight * depth_loss
+            elif stage == "dynamics_depth":
+                dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
+            elif stage == "dynamics_RGB":
+                dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
+                dynamic_mask_loss = dynamic_mask_loss
+            elif stage == "fine_coloring":
                 depth_loss = l1_loss(depth_image_tensor, gt_depth_image_tensor)
-                torchvision.utils.save_image(luminance_thresholded.float(), f"output/"+args.expname+"/dyn_splat_debug.png")
-                dynamic_splat_loss = dice_loss(dynamic_masks_tensor, gt_dynamic_masks_tensor)
-                #dynamic_splat_loss = dynamic_splatting_loss(dynamic_masks_tensor.float(), gt_dynamic_masks_tensor.float())
-                loss = Ll1 + (hyper.general_depth_weight * depth_loss) + 5 * dynamic_splat_loss
 
-            
-        else:
-            loss = Ll1
-        
-        # Add new losses with weight hyperparameters
-        # loss += hyper.dynamic_movement_weight*batch_dynamic_movement_loss + hyper.frame_stillness_weight*batch_out_of_frame_stillness_loss
-        
+
+        loss = Ll1 + depth_loss + dynamic_mask_loss
+
         psnr_ = 0
-        if not depth_only_stage:
+        if stage != "background_depth":
             psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
         
-        if stage != "background_depth" and hyper.time_smoothness_weight != 0:
+        if stage != "background_depth" and stage != "background_RGB" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
             loss += tv_loss
-        if not depth_only_stage and opt.lambda_dssim != 0:
+        if stage == "fine_coloring" and opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
         # if opt.lambda_lpips !=0:
@@ -308,11 +329,13 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         loss.backward()
 
         #kill grad of no dynamic gaussians
-        if stage == "dynamics_depth":
-            gaussians.erase_non_dynamic_grads()
+        # if stage == "dynamics_depth":
+        #    gaussians.erase_non_dynamic_grads()
         
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
+            if viewspace_point_tensor_list[idx].grad is None:
+                continue
             viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
         iter_end.record()
 
@@ -341,12 +364,13 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                         or (iteration < 60000 and iteration %  1000 == 999) \
                             or (iteration < 200000 and iteration %  2000 == 1999) :
                             # breakpoint()
-                            render_training_image(scene, gaussians, [test_cams[500%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_train_", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                            render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [test_cams[500%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            #render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
                             if stage == "dynamics_depth":
                                 render_base_path = os.path.join(scene.model_path, f"{stage}_render")
                                 image_path = os.path.join(render_base_path,"images")
-                                torchvision.utils.save_image(luminance_thresholded.float(), render_base_path+f"dyn_splat_{iteration}.png")
+                                render_pkg = render_with_dynamic_gaussians_mask(train_cams[500%len(train_cams)], gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=True)
+                                torchvision.utils.save_image((render_pkg["dynamic_only_depth"] > 0).detach().cpu().float(), render_base_path+f"_dyn_splat_{iteration}.png")
                             # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
 
                         # total_images.append(to8b(temp_image).transpose(1,2,0))
@@ -354,8 +378,14 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             # Densification
             if iteration < opt.densify_until_iter :
                 # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
+                if stage == "dynamics_depth" or "dynamics_RGB":
+                    combined_mask = gaussians._dynamic_xyz.clone()
+                    combined_mask[gaussians._dynamic_xyz] = visibility_filter
+                    gaussians.max_radii2D[combined_mask] = torch.max(gaussians.max_radii2D[combined_mask], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor_grad, combined_mask)
+                else:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
 
                 if depth_only_stage:
                     opacity_threshold = opt.opacity_threshold_coarse
@@ -394,7 +424,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             if (iteration in checkpoint_iterations) or iteration == final_iter:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
-def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, using_wandb, training_mode=0):
+def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, using_wandb):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
@@ -407,10 +437,10 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     cam_type=scene.dataset_type
 
-    total_iters=opt.coarse_iterations+opt.iterations+opt.general_depth_iterations+opt.close_dynamic_iterations
-    stages = ["background_depth", "dynamics_depth", "fine_coloring", "close_dynamics"]
-    first_iters=[0, 0, 0, 0]
-    training_iters=[opt.coarse_iterations, opt.iterations, opt.general_depth_iterations, opt.close_dynamic_iterations]
+    total_iters=opt.background_depth_iterations+opt.background_RGB_iterations+opt.dynamics_depth_iterations+opt.fine_iterations
+    stages = ["background_depth", "background_RGB", "dynamics_depth", "dynamics_RGB", "fine_coloring"]
+    first_iters=[0, 0, 0, 0, 0]
+    training_iters=[opt.background_depth_iterations, opt.background_RGB_iterations, opt.dynamics_depth_iterations, opt.dynamics_RGB_iterations, opt.fine_iterations]
     current_stage = stages[0]
     
     if checkpoint:
@@ -433,28 +463,41 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
     if  current_stage == stages[0]: 
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
-                                gaussians, scene, "background_depth", tb_writer, using_wandb, opt.coarse_iterations, timer, first_iters[0])
+                                gaussians, scene, "background_depth", tb_writer, using_wandb, training_iters[0], timer, first_iters[0])
         render_set_no_compression(dataset.model_path, "background_depth_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
         current_stage = stages[1]
     
-
-    if  current_stage == stages[1]:
+    if  current_stage == stages[1]: 
+        dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+                                checkpoint_iterations, checkpoint, debug_from,
+                                gaussians, scene, "background_RGB", tb_writer, using_wandb, training_iters[1], timer, first_iters[1])
+        render_set_no_compression(dataset.model_path, "background_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
+        current_stage = stages[2]
+        
+    if  current_stage == stages[2]:
         # Initialize dynamic gaussians in the model
         gaussians.spawn_dynamic_gaussians()
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
-                                gaussians, scene, "dynamics_depth", tb_writer, using_wandb, opt.iterations, timer, first_iters[1])
+                                gaussians, scene, "dynamics_depth", tb_writer, using_wandb, training_iters[2], timer, first_iters[2])
         render_set_no_compression(dataset.model_path, "dynamics_depth_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
-        current_stage = stages[2]
+        current_stage = stages[3]
+
+    if  current_stage == stages[3]:
+        dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
+                                checkpoint_iterations, checkpoint, debug_from,
+                                gaussians, scene, "dynamics_RGB", tb_writer, using_wandb, training_iters[3], timer, first_iters[3])
+        render_set_no_compression(dataset.model_path, "dynamics_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
+        current_stage = stages[4]
     
 
 
-    if  current_stage == stages[2]:
+    if  current_stage == stages[4]:
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
-                                gaussians, scene, "fine_coloring", tb_writer, using_wandb, opt.general_depth_iterations, timer, first_iters[2])
+                                gaussians, scene, "fine_coloring", tb_writer, using_wandb, training_iters[4], timer, first_iters[4])
         render_set_no_compression(dataset.model_path, "fine_coloring_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
-        current_stage = stages[3]
+
         
     
 
@@ -462,12 +505,6 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
     distances, colors, opacities = dynamics_by_depth.movement_by_rendering(dataset.model_path, "dynamics", scene.getTrainCameras(), gaussians, pipe, background, cam_type, render_func = render_dynamic_gaussians_mask_and_compare)
     render_set_no_compression(dataset.model_path, "filtered_color_by_movement", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, override_color = colors, override_opacity = opacities, render_func = render_with_dynamic_gaussians_mask)
 
-    #if (training_mode == 1) and current_stage == "close_dynamic":   ## 4 stage training
-    #    dynamic_depth_scene_reconstructionscene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
-    #                            checkpoint_iterations, checkpoint, debug_from,
-    #                            gaussians, scene, "close_dynamics", tb_writer, using_wandb, opt.close_dynamic_iterations, timer, first_iters[3])
-    
-    
     render_set_no_compression(dataset.model_path, "final_train_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
     evaluate_single_folder(os.path.join(dataset.model_path, "final_train_render", "ours_{}".format(total_iters)))
     
@@ -587,17 +624,15 @@ if __name__ == "__main__":
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
     parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
-    parser.add_argument('--general_depth_weight', type=float, default=0.5)
-    
-    #Which training pipeline, 0 is regular, 1 is with general depth and close depth, 2 is probabilistic paralel depth
-    parser.add_argument('--training_mode', type=int, default=1)
+    parser.add_argument('--general_depth_weight', type=float, default=0.1)
 
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--coarse_iter", type=int, default = 6000)
+    parser.add_argument("--background_depth_iter", type=int, default = 10000)
+    parser.add_argument("--background_RGB_iter", type=int, default = 5000)
+    parser.add_argument("--dynamics_depth_iter", type=int, default = 10000)
+    parser.add_argument("--dynamics_RGB_iter", type=int, default = 5000)
     parser.add_argument("--fine_iter", type=int, default = 20000)
-    parser.add_argument("--general_depth_iter", type=int, default = 0)
-    parser.add_argument("--close_dynamic_iter", type=int, default = 0)
     parser.add_argument("--netork_width", type=int, default = 128)
     parser.add_argument("--bs", type=int, default = 16)
 
@@ -607,7 +642,11 @@ if __name__ == "__main__":
     hp = ModelHiddenParams(parser)
     
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+    args.save_iterations.append(args.background_depth_iter)
+    args.save_iterations.append(args.background_RGB_iter)
+    args.save_iterations.append(args.dynamics_depth_iter)
+    args.save_iterations.append(args.dynamics_RGB_iter)
+    args.save_iterations.append(args.fine_iter)
     if args.configs:
         import mmengine
         from utils.params_utils import merge_hparams
@@ -620,12 +659,12 @@ if __name__ == "__main__":
         wandb.init()
         config = wandb.config
         # Define your experiment name template (you can also hardcode it here or pass it via the config)
-        name_template = "exp_ci{coarse_iter}_fi{fine_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
+        name_template = "exp_bd{background_depth_iter}_dd{dynamics_depth_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
 
         # Generate the experiment name using the hyperparameters from the sweep
         experiment_name = name_template.format(
-            coarse_iter=config.coarse_iter,
-            fine_iter=config.fine_iter,
+            background_depth_iter=config.background_depth_iter,
+            dynamics_depth_iter=config.dynamics_depth_iter,
             defor_depth=config.defor_depth,
             net_width=config.net_width,
             grid_lr_init=config.grid_lr_init,
@@ -647,10 +686,11 @@ if __name__ == "__main__":
 
     # Manual setting for sweeps
     op_params = op.extract(args)
-    op_params.coarse_iterations =  args.coarse_iter
-    op_params.iterations =  args.fine_iter
-    op_params.general_depth_iterations =  args.general_depth_iter
-    op_params.close_dynamic_iterations =  args.close_dynamic_iter
+    op_params.background_depth_iterations =  args.background_depth_iter
+    op_params.background_RGB_iterations =  args.background_RGB_iter
+    op_params.dynamics_depth_iterations =  args.dynamics_depth_iter
+    op_params.dynamics_RGB_iterations =  args.dynamics_depth_iter
+    op_params.fine_iterations =  args.fine_iter
     op_params.batch_size =  args.bs
 
     hp_params = hp.extract(args)
@@ -660,7 +700,7 @@ if __name__ == "__main__":
     hp_params.general_depth_weight = args.general_depth_weight
     
 
-    dynamic_depth_training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb, args.training_mode)
+    dynamic_depth_training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb)
 
     # All done
     print("\nTraining complete.")

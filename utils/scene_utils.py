@@ -12,8 +12,11 @@ import copy
 def render_training_image(scene, gaussians, viewpoints, render_func, pipe, background, stage, iteration, time_now, dataset_type):
     def render(gaussians, viewpoint, path, scaling, cam_type):
         # scaling_copy = gaussians._scaling
-        render_pkg = render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=cam_type)
-        label1 = f"stage:{stage},iter:{iteration}"
+        if stage != "fine_coloring":
+            render_pkg = render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=cam_type, training=True)
+        else:
+            render_pkg = render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=cam_type, training=False)
+        label1 = f"stage:{stage}_train_,iter:{iteration}"
         times =  time_now/60
         if times < 1:
             end = "min"
@@ -64,10 +67,10 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
         draw1.text(label2_position, label2, fill=text_color, font=font)
         
         image_with_labels.save(path)
-    render_base_path = os.path.join(scene.model_path, f"{stage}_render")
+    render_base_path = os.path.join(scene.model_path, f"{stage}_train_render")
     point_cloud_path = os.path.join(render_base_path,"pointclouds")
     image_path = os.path.join(render_base_path,"images")
-    if not os.path.exists(os.path.join(scene.model_path, f"{stage}_render")):
+    if not os.path.exists(os.path.join(scene.model_path, f"{stage}_train_render")):
         os.makedirs(render_base_path)
     if not os.path.exists(point_cloud_path):
         os.makedirs(point_cloud_path)

@@ -111,8 +111,10 @@ class OptimizationParams(ParamGroup):
         self.dataloader=False
         self.zerostamp_init=False
         self.custom_sampler=None
-        self.iterations = 30_000
-        self.coarse_iterations = 3000
+        self.background_depth_iterations = 10_000
+        self.background_RGB_iterations = 10_000
+        self.dynamics_depth_iterations = 10_000
+        self.fine_iterations = 10_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01

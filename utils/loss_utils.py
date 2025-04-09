@@ -35,6 +35,97 @@ def l1_filtered_depth_valid_loss(network_output, gt, filter):
     valid_filter = torch.logical_and(filter,valid_depth)
     return torch.abs((network_output[valid_filter] - gt[valid_filter])).mean()
 
+def log_depth_loss(pred_depth, gt_depth, eps=1e-8):
+
+    valid_depth = gt_depth > 0.001
+
+    # Compute element-wise L1 distance between prediction and ground truth
+    dist = torch.abs(pred_depth[valid_depth] - gt_depth[valid_depth])
+
+    # Compute log(1 + L1 distance)
+    log_term = torch.log(1.0 + dist + eps)
+
+    # Average across all valid pixels
+    loss = log_term.mean()
+
+    return loss
+
+def log_filtered_depth_loss(pred_depth, gt_depth, filter, eps=1e-8):
+
+    valid_depth = gt_depth > 0.001
+    valid_filter = torch.logical_and(filter,valid_depth)
+
+    # Compute element-wise L1 distance between prediction and ground truth
+    dist = torch.abs(pred_depth[valid_filter] - gt_depth[valid_filter])
+
+    # Compute log(1 + L1 distance)
+    log_term = torch.log(1.0 + dist + eps)
+
+    # Average across all valid pixels
+    loss = log_term.mean()
+
+    return loss
+
+def iou_loss(pred, gt, eps=1e-6):
+
+    intersection = (pred * gt).sum()
+    union = pred.sum() + gt.sum() - intersection + eps
+    iou = intersection / union
+    return 1 - iou
+
+def recall_loss(pred, gt, eps=1e-6):
+
+    intersection = (pred * gt).sum()
+    recall = intersection / (gt.sum() + eps)
+    return 1 - recall
+    
+import torch
+
+def chamfer_loss(pred_list, gt_list, eps=1e-8):
+    """
+    Computes the average Chamfer distance over a batch.
+    
+    Each element in pred_list and gt_list is expected to be a torch.Tensor
+    of shape (M, 3) and (N, 3) respectively, representing a set of 3D points.
+    
+    Args:
+        pred_list (list of torch.Tensor): List of predicted 3D point sets.
+        gt_list (list of torch.Tensor): List of ground-truth 3D point sets.
+        eps (float): Small constant to avoid numerical issues.
+        
+    Returns:
+        torch.Tensor: A scalar tensor containing the average Chamfer distance.
+    """
+    assert len(pred_list) == len(gt_list), "Batch sizes must match."
+    batch_size = len(pred_list)
+    chamfer_losses = []
+    
+    for pred_pts, gt_pts in zip(pred_list, gt_list):
+        # Ensure the point sets have shape (N,3) (if not, reshape appropriately)
+        if pred_pts.ndim != 2 or pred_pts.shape[1] != 3:
+            raise ValueError("Each predicted point set must have shape (M, 3)")
+        if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
+            raise ValueError("Each ground-truth point set must have shape (N, 3)")
+        
+        # Compute pairwise distances (squared) between predicted and ground-truth points.
+        # Using torch.cdist for efficient pairwise distance computation.
+        dist_matrix = torch.cdist(pred_pts, gt_pts, p=2).pow(2)  # shape (M, N)
+        
+        # For each predicted point, compute the min distance to any ground-truth point.
+        min_dist_sq_pred, _ = torch.min(dist_matrix, dim=1)  # shape (M,)
+        loss_pred = torch.sqrt(min_dist_sq_pred + eps).mean()
+        
+        # For each ground-truth point, compute the min distance to any predicted point.
+        min_dist_sq_gt, _ = torch.min(dist_matrix, dim=0)  # shape (N,)
+        loss_gt = torch.sqrt(min_dist_sq_gt + eps).mean()
+        
+        chamfer_losses.append(loss_pred + loss_gt)
+    
+    # Return the average Chamfer distance over the batch.
+    return torch.stack(chamfer_losses).mean()
+
+
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 

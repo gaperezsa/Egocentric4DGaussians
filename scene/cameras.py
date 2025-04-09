@@ -14,6 +14,35 @@ from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getWorld2ViewAria
 
+def write_point_cloud_to_ply(points: torch.Tensor, filename: str):
+    """
+    Writes a point cloud to a .ply file in ASCII format.
+    
+    Args:
+        points (torch.Tensor): A tensor of shape (N, 3) containing world-space 3D points.
+        filename (str): The filename (including path) where the .ply file will be saved.
+    """
+    # Ensure the tensor is on CPU and converted to a NumPy array
+    if points.is_cuda:
+        points = points.cpu()
+    points_np = points.numpy()
+    num_points = points_np.shape[0]
+
+    with open(filename, 'w') as ply_file:
+        # Write the PLY header
+        ply_file.write("ply\n")
+        ply_file.write("format ascii 1.0\n")
+        ply_file.write(f"element vertex {num_points}\n")
+        ply_file.write("property float x\n")
+        ply_file.write("property float y\n")
+        ply_file.write("property float z\n")
+        ply_file.write("end_header\n")
+        # Write each point's coordinates
+        for point in points_np:
+            ply_file.write(f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f}\n")
+
+
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
@@ -65,6 +94,41 @@ class Camera(nn.Module):
         # .cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    def backproject_mask_to_world(self):
+        """
+        Returns an (N,3) tensor of world‑space 3D points for all True pixels in camera.mask,
+        using camera.depth and the camera intrinsics/extrinsics baked into the Camera object.
+        """
+        depth = self.depth_image        # shape (H, W)
+        mask = self.dynamic_mask          # shape (H, W), dtype=torch.bool
+        device = depth.device
+
+        H, W = depth.shape
+
+        # Compute focal lengths from FoV
+        fx = W / (2 * torch.tan(torch.tensor(self.FoVx) / 2))
+        fy = H / (2 * torch.tan(torch.tensor(self.FoVy) / 2))
+        cx, cy = W * 0.5, H * 0.5
+
+        # Get pixel indices where mask==True
+        ys, xs = torch.nonzero(mask, as_tuple=True)
+        zs = depth[ys, xs]
+
+        # Convert pixel → camera coords
+        x_cam = (xs.float() - cx) * zs / fx
+        y_cam = (ys.float() - cy) * zs / fy
+        ones = torch.ones_like(zs)
+
+        cam_pts_h = torch.stack([x_cam, y_cam, zs, ones], dim=-1)  # (N,4)
+
+        # Transform from camera to world: invert world_view_transform
+        cam2world = torch.inverse(self.world_view_transform.to(device)).T
+        # cam2world = self.world_view_transform.to(device)
+        world_pts_h = (cam2world @ cam_pts_h.T).T
+
+        return world_pts_h[:, :3]  # (N, 3)
+    
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform, time):

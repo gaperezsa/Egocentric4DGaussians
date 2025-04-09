@@ -551,7 +551,7 @@ class GaussianModel:
 
     def spawn_dynamic_gaussians(self, selected_pts_mask=None):
         if selected_pts_mask is None:
-            selected_pts_mask = torch.rand(self._xyz.shape[0]) < 0.3
+            selected_pts_mask = torch.rand(self._xyz.shape[0]) < 0.01
         else:
             assert ( len(selected_pts_mask) == self._xyz.shape[0] )
         new_xyz = self._xyz[selected_pts_mask]

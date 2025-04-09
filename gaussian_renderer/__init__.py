@@ -306,7 +306,7 @@ def render_dynamic_compare(viewpoint_camera, pc : GaussianModel, pipe, bg_color 
     return per_gaussian_valid_dynamic_movement
 
 
-def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_opacity = None, stage = "fine", cam_type = None):
+def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_opacity = None, stage = "fine", cam_type = None, training = False):
     """
     Render the scene. 
     
@@ -445,33 +445,84 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # time3 = get_time()
-    rendered_image, radii, depth = rasterizer(
-        means3D = means3D_final,
-        means2D = means2D,
-        shs = shs_final,
-        colors_precomp = colors_precomp,
-        opacities = opacity_final,
-        scales = scales_final,
-        rotations = rotations_final,
-        cov3D_precomp = cov3D_precomp)
-    
-    dynamic_only_splat = None
-    if dynamic_gaussians_mask.sum().item() > 1:
-        if cov3D_precomp is not None:
-            dynamic_cov3D_precomp = cov3D_precomp[dynamic_gaussians_mask]
-        else:
-            dynamic_cov3D_precomp = None
 
-        if stage != "background_depth":
-            dynamic_only_splat, dynamic_only_radii, _ = rasterizer(
+    # Initialize all possible returning variables to None
+    rendered_image = None
+    radii = None
+    depth = None
+    dynamic_only_splat = None
+    dynamic_only_radii = None
+    dynamic_only_depth = None
+    static_only_splat = None
+    static_only_radii = None
+    static_only_depth = None
+
+    # If we are training, we will render static and dynamic gaussians separately
+    if training:
+        # Check if there are any dynamic gaussians
+        if dynamic_gaussians_mask.sum().item() > 1:
+
+            if colors_precomp is not None:
+                dynamic_masked_colors_precomp = colors_precomp[dynamic_gaussians_mask]
+                non_dynamic_masked_colors_precomp = colors_precomp[~dynamic_gaussians_mask]
+            else :
+                dynamic_masked_colors_precomp = None
+                non_dynamic_masked_colors_precomp = None
+
+            if cov3D_precomp is not None:
+                dynamic_masked_cov3D_precomp = cov3D_precomp[dynamic_gaussians_mask]
+                non_dynamic_masked_cov3D_precomp = cov3D_precomp[~dynamic_gaussians_mask]
+            else :
+                dynamic_masked_cov3D_precomp = None
+                non_dynamic_masked_cov3D_precomp = None
+
+            dynamic_only_splat, dynamic_only_radii, dynamic_only_depth = rasterizer(
                 means3D = means3D_final[dynamic_gaussians_mask],
                 means2D = means2D[dynamic_gaussians_mask],
-                shs = None,
-                colors_precomp = 1 - bg_color.repeat(pc._dynamic_xyz.sum().item(),1),
+                shs = shs_final[dynamic_gaussians_mask],
+                colors_precomp = dynamic_masked_colors_precomp,
                 opacities = opacity_final[dynamic_gaussians_mask],
                 scales = scales_final[dynamic_gaussians_mask],
                 rotations = rotations_final[dynamic_gaussians_mask],
-                cov3D_precomp = dynamic_cov3D_precomp)
+                cov3D_precomp = dynamic_masked_cov3D_precomp)
+            
+            static_only_splat, static_only_radii, static_only_depth = rasterizer(
+                means3D = means3D_final[~dynamic_gaussians_mask],
+                means2D = means2D[~dynamic_gaussians_mask],
+                shs = shs_final[~dynamic_gaussians_mask],
+                colors_precomp = non_dynamic_masked_colors_precomp,
+                opacities = opacity_final[~dynamic_gaussians_mask],
+                scales = scales_final[~dynamic_gaussians_mask],
+                rotations = rotations_final[~dynamic_gaussians_mask],
+                cov3D_precomp = non_dynamic_masked_cov3D_precomp)
+
+            rendered_image, radii, depth = dynamic_only_splat, dynamic_only_radii, dynamic_only_depth
+
+        # if there arent, the static only ones *are* the scene
+        else:
+            static_only_splat, static_only_radii, static_only_depth = rasterizer(
+                means3D = means3D_final,
+                means2D = means2D,
+                shs = shs_final,
+                colors_precomp = colors_precomp,
+                opacities = opacity_final,
+                scales = scales_final,
+                rotations = rotations_final,
+                cov3D_precomp = cov3D_precomp)
+            rendered_image, radii, depth = static_only_splat, static_only_radii, static_only_depth
+
+    # If we are not training or in the last fine stage, the entire scene is returned
+    else:
+        rendered_image, radii, depth = rasterizer(
+            means3D = means3D_final,
+            means2D = means2D,
+            shs = shs_final,
+            colors_precomp = colors_precomp,
+            opacities = opacity_final,
+            scales = scales_final,
+            rotations = rotations_final,
+            cov3D_precomp = cov3D_precomp)
+
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -481,10 +532,14 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
             "visibility_filter" : radii > 0,
             "radii": radii,
             "depth":depth,
-            "dynamic_only_splat": dynamic_only_splat,
-            "dynamic_only_visibility_filter": dynamic_only_splat
+            "static_only_render": static_only_splat,
+            "static_only_radii": static_only_radii,
+            "static_only_depth": static_only_depth,
+            "dynamic_only_render": dynamic_only_splat,
+            "dynamic_only_radii": dynamic_only_radii,
+            "dynamic_only_depth": dynamic_only_depth,
+            "dynamic_3D_means": means3D_final[dynamic_gaussians_mask]
             }
-
 
 
 def render_dynamic_gaussians_mask_and_compare(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):

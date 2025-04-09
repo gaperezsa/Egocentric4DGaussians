@@ -11,7 +11,7 @@ def apply_jet_colormap(depth_image):
 
     # Apply the Jet colormap directly based on raw depth values
     # Convert depth values to 8-bit range for colormap (Jet colormap requires values in the range [0, 255])
-    depth_8bit = ((depth_array)/3000 * 255).astype(np.uint8)
+    depth_8bit = ((depth_array)/4000 * 255).astype(np.uint8)
 
     # Apply Jet colormap
     colored_image = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
