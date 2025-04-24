@@ -43,6 +43,36 @@ def save_pointcloud_as_ply(tensor, filename):
         for point in points:
             ply_file.write(f"{point[0]} {point[1]} {point[2]}\n")
     
+def get_deformed_gaussian_centers(viewpoint_camera, pc : GaussianModel):
+    means3D = pc.get_xyz
+    
+    opacity = pc._opacity
+    shs = pc.get_features
+    scales = pc._scaling
+    rotations = pc._rotation
+    if hasattr(pc,"_dynamic_xyz"):
+        dynamic_gaussians_mask = pc._dynamic_xyz
+        time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D[dynamic_gaussians_mask].shape[0],1)
+        if dynamic_gaussians_mask.sum().item() > 1:
+            # Perform deformation on the selected indices
+            (
+                means3D_deformed,
+                scales_deformed,
+                rotations_deformed,
+                opacity_deformed,
+                shs_deformed
+            ) = pc._deformation(
+                means3D[dynamic_gaussians_mask],
+                scales[dynamic_gaussians_mask],
+                rotations[dynamic_gaussians_mask],
+                opacity[dynamic_gaussians_mask],
+                shs[dynamic_gaussians_mask],
+                time
+            )
+    return means3D_deformed
+
+
+
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_opacity = None, stage = "fine", cam_type = None, time_dynamic_loss = False, out_of_frame_loss_flag = False):
     """

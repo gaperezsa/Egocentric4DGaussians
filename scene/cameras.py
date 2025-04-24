@@ -128,6 +128,20 @@ class Camera(nn.Module):
         world_pts_h = (cam2world @ cam_pts_h.T).T
 
         return world_pts_h[:, :3]  # (N, 3)
+
+    def to_device(self, device):
+        self.original_image = self.original_image.to(device)
+        if self.depth_image is not None:
+            self.depth_image = self.depth_image.to(device)
+        if self.dynamic_mask is not None:
+            self.dynamic_mask = self.dynamic_mask.to(device)
+
+        # Move rotation and translation matrix
+        #self.R = self.R.to(device)
+        #self.T = self.T.to(device)
+        # Also move precomputed transformation matrices:
+        self.world_view_transform = self.world_view_transform.to(device)
+        self.projection_matrix = self.projection_matrix.to(device)
     
 
 class MiniCam:
