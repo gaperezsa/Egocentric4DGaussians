@@ -11,7 +11,7 @@ def create_video_from_png(folder_path, output_video_path):
     # Print folder name being processed
     print(f"Processing folder: {folder_path}")
     # Search for .png files in the folder
-    png_files = glob.glob(os.path.join(folder_path, '*.jpg'))
+    png_files = glob.glob(os.path.join(folder_path, '*.png'))
     # Sort the list of file paths
     sorted_files = sorted(png_files)
 
@@ -57,6 +57,6 @@ if __name__ == "__main__":
     
 
     # aria
-    folder_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/chamfer_debugging_short_5/dynamics_RGB_train_render/images"
-    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/chamfer_debugging_short_5/dynamics_RGB_train_render/images/stage4_train.mp4"
+    folder_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/Video5/images"
+    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/Video5/video5_rgb.mp4"
     create_video_from_png(folder_path, output_video_path)

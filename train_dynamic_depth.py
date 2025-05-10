@@ -13,7 +13,7 @@ import random
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss,l1_filtered_loss, log_depth_loss, log_filtered_depth_loss, l1_inverse_distance_loss, l1_proximity_loss, ssim, l2_loss, lpips_loss, iou_loss, recall_loss, chamfer_loss
+from utils.loss_utils import l1_loss,l1_filtered_loss, chamfer_loss, l1_background_colored_masked_loss
 from gaussian_renderer import render, network_gui, render_with_dynamic_gaussians_mask, render_dynamic_gaussians_mask_and_compare, get_deformed_gaussian_centers
 from render import render_set_no_compression
 from metrics import evaluate_single_folder
@@ -61,11 +61,23 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, using_wandb, train_iter,timer, first_iter=0):
 
-    gaussians.training_setup(opt)
+    # setup model learning rates
+
+    # if fine stage, we downsalce learning rates regarding position and movement, we dont eant model to focus on moving things but rather fixing appearance
+    if stage == "fine_coloring":
+        modified_optimizer_params = copy.copy(opt)
+        modified_optimizer_params.position_lr_init *= opt.fine_opt_dyn_lr_downscaler
+        modified_optimizer_params.deformation_lr_init *= opt.fine_opt_dyn_lr_downscaler
+        modified_optimizer_params.grid_lr_init *= opt.fine_opt_dyn_lr_downscaler
+        gaussians.training_setup(modified_optimizer_params)
+    else:
+        gaussians.training_setup(opt)
 
     rendering_only_background_or_only_dynamic = stage!="fine_coloring"
 
     depth_only_stage = stage=="background_depth" or stage=="dynamics_depth"
+
+    hyper.general_depth_weight = 0.5 #### BURNT IN FOR THE MOMENT
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -161,9 +173,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             try:
                 viewpoint_cams = next(loader)
             except StopIteration:
-                print("reset dataloader into random dataloader.")
                 if not random_loader:
-                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=32,collate_fn=list)
+                    print("reset dataloader into random dataloader.")
+                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=16,collate_fn=list)
                     random_loader = True
                 loader = iter(viewpoint_stack_loader)
 
@@ -265,9 +277,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         if stage != "dynamics_depth":
             gt_dynamic_masks_tensor = torch.cat(gt_dynamic_masks,0)
 
-            image_tensor = torch.cat(images,0)
-            gt_image_tensor = torch.cat(gt_images,0)
-
             depth_image_tensor = torch.cat(depth_images,0)
             gt_depth_image_tensor = torch.cat(gt_depth_images,0)
 
@@ -284,7 +293,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             elif stage == "dynamics_RGB":
                 mask = (gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
                 dynamic_image_tensor = torch.cat(dynamic_image,0)
-                Ll1 = l1_filtered_loss(dynamic_image_tensor, gt_image_tensor[:,:3,:,:], mask)
+                Ll1 = l1_background_colored_masked_loss(dynamic_image_tensor, gt_image_tensor[:,:3,:,:], mask, background)
             elif stage == "fine_coloring":
                 Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
 
@@ -379,10 +388,11 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
             timer.start()
 
+
             # Densification
             if iteration < opt.densify_until_iter and stage != "dynamics_depth":
                 # Keep track of max radii in image-space for pruning
-                if stage == "dynamics_depth" or "dynamics_RGB":
+                if stage == "dynamics_depth" or stage == "dynamics_RGB":
                     combined_mask = gaussians._dynamic_xyz.clone()
                     combined_mask[gaussians._dynamic_xyz] = visibility_filter
                     gaussians.max_radii2D[combined_mask] = torch.max(gaussians.max_radii2D[combined_mask], radii[visibility_filter])
@@ -401,7 +411,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     opacity_threshold = opt.opacity_threshold_fine_after
                     densify_threshold = opt.densify_grad_threshold_after
                     
-                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
+                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and stage != "fine_coloring":
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
@@ -411,7 +421,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
                     
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
-                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point:
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage != "fine_coloring":
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
                     # torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
@@ -459,6 +469,9 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                 if first_iter < training_iters[i] and abs(first_iter/(training_iters[i]+1)) < 0.9:
                     first_iters[i] = first_iter
                     current_stage = stages[i]
+                elif i+1 >= len(stages):
+                    current_stage = "final"
+                    render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
                 else:
                     current_stage = stages[i+1]
                     render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
@@ -623,19 +636,20 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 10001, 14001, 20001, 45001])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 40, 1000, 5000, 10000, 14000, 20000, 45000, 60000, 100000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 40, 1000, 5000, 10000, 14000, 20000, 30000, 45000, 60000, 100000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[40, 1000, 5000, 10000, 14000, 20000, 45000, 60000, 100000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[40, 1000, 5000, 10000, 14000, 20000, 30000, 45000, 60000, 100000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
     parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
-    parser.add_argument('--chamfer_weight', type=float, default=5.0)
+    parser.add_argument('--chamfer_weight', type=float, default=50.0)
+    parser.add_argument('--fine_opt_dyn_lr_downscaler', type=float, default=0.01)
 
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--background_depth_iter", type=int, default = 10000)
-    parser.add_argument("--background_RGB_iter", type=int, default = 5000)
+    parser.add_argument("--background_depth_iter", type=int, default = 20000)
+    parser.add_argument("--background_RGB_iter", type=int, default = 14000)
     parser.add_argument("--dynamics_depth_iter", type=int, default = 10000)
     parser.add_argument("--dynamics_RGB_iter", type=int, default = 5000)
     parser.add_argument("--fine_iter", type=int, default = 20000)
@@ -666,13 +680,17 @@ if __name__ == "__main__":
         config = wandb.config
         # Define your experiment name template (you can also hardcode it here or pass it via the config)
         #name_template = "exp_bd{background_depth_iter}_dd{dynamics_depth_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
-        name_template = "exp_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamfer_weight{chamfer_weight}"
+        name_template = "exp_backDepth{background_depth_iter}_backRGB{background_RGB_iter}_dynDepth{dynamics_depth_iter}_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamferWeight{chamfer_weight}_fineOptDynLrDownscaler{fine_opt_dyn_lr_downscaler}_colouredBackground"
 
         # Generate the experiment name using the hyperparameters from the sweep
         experiment_name = name_template.format(
+            background_depth_iter = config.background_depth_iter,
+            background_RGB_iter = config.background_RGB_iter,
+            dynamics_depth_iter = config.dynamics_depth_iter,
             dynamics_RGB_iter = config.dynamics_RGB_iter,
             fine_iter = config.fine_iter,
-            chamfer_weight = config.chamfer_weight
+            chamfer_weight = config.chamfer_weight,
+            fine_opt_dyn_lr_downscaler = config.fine_opt_dyn_lr_downscaler
         )
 
         # Optionally, update the run name in wandb
@@ -698,6 +716,7 @@ if __name__ == "__main__":
     op_params.fine_iterations =  args.fine_iter
     op_params.batch_size =  args.bs
     op_params.chamfer_weight = args.chamfer_weight
+    op_params.fine_opt_dyn_lr_downscaler = args.fine_opt_dyn_lr_downscaler
 
     hp_params = hp.extract(args)
     if type(hp_params.multires) == type(list()) and type(hp_params.multires[0]) == type(str()):

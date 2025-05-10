@@ -27,8 +27,19 @@ def l1_proximity_loss(network_output, gt, max=1):
     close_filter = gt[gt<max]
     return torch.abs((network_output[close_filter] - gt[close_filter])).mean()
 
-def l1_filtered_loss(network_output, gt, filter):
-    return torch.abs((network_output[filter] - gt[filter])).mean()
+def l1_filtered_loss(network_output, gt, mask):
+    return torch.abs((network_output[mask] - gt[mask])).mean()
+
+def l1_background_colored_masked_loss(network_output, gt, mask, background_color):
+    '''
+    network_output of shape (bs,3,h,w)
+    gt of shape (bs,3,h,w)
+    mask of shape (bs,3,h,w)
+    background_color of shape (3,)
+    '''
+    # Converting to tensor of broadcastable dimension and replacing outside the mask with background color
+    backgrounded_image = torch.where(mask, gt, background_color.view(1,3,1,1))
+    return torch.abs((network_output - backgrounded_image)).mean()
 
 def l1_filtered_depth_valid_loss(network_output, gt, filter):
     valid_depth = gt > 0.001
