@@ -135,6 +135,50 @@ def chamfer_loss(pred_list, gt_list, eps=1e-8):
     # Return the average Chamfer distance over the batch.
     return torch.stack(chamfer_losses).mean()
 
+def chamfer_with_median(pred_list, gt_list, eps=1e-8):
+    """
+    Like chamfer_loss, but also collects all "pred→gt" nearest‐neighbor distances
+    and returns their median.
+
+    Returns:
+        loss (Tensor scalar): average Chamfer distance over the batch.
+        median_dist (float): median of sqrt(min_dist_sq_pred) over all pred points.
+    """
+    assert len(pred_list) == len(gt_list), "Batch sizes must match."
+    chamfer_losses = []
+    all_min_dists = []  # will store sqrt(min_dist_sq_pred) for every pred‐point
+
+    for pred_pts, gt_pts in zip(pred_list, gt_list):
+        # both must be [M,3] and [N,3]
+        if pred_pts.ndim != 2 or pred_pts.shape[1] != 3:
+            raise ValueError("Each predicted set must have shape (M,3)")
+        if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
+            raise ValueError("Each GT set must have shape (N,3)")
+
+        # 1) Compute squared pairwise distances [M×N]
+        dist_matrix = torch.cdist(pred_pts, gt_pts, p=2).pow(2)  # [M,N]
+
+        # 2) For each pred point, find its min‐squared‐dist to GT
+        min_dist_sq_pred, _ = torch.min(dist_matrix, dim=1)  # [M]
+        # record the *actual* (sqrt) distances
+        all_min_dists.append(torch.sqrt(min_dist_sq_pred + eps))  # [M]
+
+        # 3) For each GT point, find its min‐squared‐dist to pred
+        min_dist_sq_gt, _ = torch.min(dist_matrix, dim=0)  # [N]
+
+        # 4) per‐set Chamfer = mean over sqrt + mean over sqrt
+        loss_pred = torch.sqrt(min_dist_sq_pred + eps).mean()
+        loss_gt   = torch.sqrt(min_dist_sq_gt + eps).mean()
+        chamfer_losses.append(loss_pred + loss_gt)
+
+    # 5) Combine batch‐loss
+    loss = torch.stack(chamfer_losses).mean()
+
+    # 6) Flatten all "pred→gt" distances into one big vector, then median
+    all_min_dists = torch.cat(all_min_dists, dim=0)  # length = total #pred‐points
+    median_dist = torch.median(all_min_dists).item() # scalar float
+
+    return loss, median_dist
 
 
 def l2_loss(network_output, gt):

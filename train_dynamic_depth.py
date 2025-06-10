@@ -1,4 +1,5 @@
 #
+# train_dynamic_depth.py - main training entrypoint
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -8,16 +9,17 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-import numpy as np
-import random
+import numpy as np  # numerical operations
+import random       # random sampling
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss,l1_filtered_loss, chamfer_loss, l1_background_colored_masked_loss
+from utils.exocentric_utils import compute_exocentric_from_file
+from utils.graphics_utils import getWorld2View2
+from utils.loss_utils import l1_loss, l1_filtered_loss, chamfer_loss, chamfer_with_median, l1_background_colored_masked_loss
 from gaussian_renderer import render, network_gui, render_with_dynamic_gaussians_mask, render_dynamic_gaussians_mask_and_compare, get_deformed_gaussian_centers
 from render import render_set_no_compression
 from metrics import evaluate_single_folder
-import sys
 from scene import Scene, GaussianModel, dynamics_by_depth
 from utils.general_utils import safe_state
 import uuid
@@ -32,13 +34,13 @@ from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
 import lpips
 from utils.scene_utils import render_training_image
+from utils.render_utils import prune_by_visibility, prune_by_average_radius, look_at
 from time import time
 import copy
 import json
-
 import wandb
 
-to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
+to8b = lambda x: (255 * np.clip(x.cpu().numpy(), 0, 1)).astype(np.uint8)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -46,227 +48,199 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
     
-    
+# Ensure cameras are time-sorted
 def check_and_sort_viewpoint_stack(viewpoint_stack):
-    # Check if the list is already sorted
     is_sorted = all(viewpoint_stack[i].time <= viewpoint_stack[i + 1].time for i in range(len(viewpoint_stack) - 1))
-    
     if not is_sorted:
-        # Sort the list by the time attribute
         viewpoint_stack.sort(key=lambda x: x.time)
-        
     return viewpoint_stack
 
+# Core training loop per stage
 def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, using_wandb, train_iter,timer, first_iter=0):
+                         gaussians, scene, stage, tb_writer, using_wandb, train_iter, timer, first_iter=0):
 
-    # setup model learning rates
-
-    # if fine stage, we downsalce learning rates regarding position and movement, we dont eant model to focus on moving things but rather fixing appearance
+    # Setup learning rates based on stage
     if stage == "fine_coloring":
         modified_optimizer_params = copy.copy(opt)
         modified_optimizer_params.position_lr_init *= opt.fine_opt_dyn_lr_downscaler
         modified_optimizer_params.deformation_lr_init *= opt.fine_opt_dyn_lr_downscaler
         modified_optimizer_params.grid_lr_init *= opt.fine_opt_dyn_lr_downscaler
         gaussians.training_setup(modified_optimizer_params)
+    elif stage == "dynamics_depth":
+        modified_optimizer_params = copy.copy(opt)
+        modified_optimizer_params.feature_lr = 0
+        modified_optimizer_params.opacity_lr = 0
+        modified_optimizer_params.scaling_lr = 0
+        modified_optimizer_params.rotation_lr = 0
+        gaussians.training_setup(modified_optimizer_params)
     else:
         gaussians.training_setup(opt)
 
-    rendering_only_background_or_only_dynamic = stage!="fine_coloring"
-
-    depth_only_stage = stage=="background_depth" or stage=="dynamics_depth"
-
-    hyper.general_depth_weight = 0.5 #### BURNT IN FOR THE MOMENT
+    rendering_only_background_or_only_dynamic = stage != "fine_coloring"
+    depth_only_stage = stage in ("background_depth", "dynamics_depth")
+    hyper.general_depth_weight = 0.5  # temporary weight
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     ema_psnr_for_log = 0.0
 
     final_iter = train_iter
-    
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
+
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
-    
+
+    # If not using DataLoader, load all train cams as a stack
     if not viewpoint_stack and not opt.dataloader:
-        # dnerf's branch
-        viewpoint_stack = [i for i in train_cams]
+        viewpoint_stack = list(train_cams)
         viewpoint_stack = check_and_sort_viewpoint_stack(viewpoint_stack)
         temp_list = copy.deepcopy(viewpoint_stack)
-        #filtered = [c for c in viewpoint_stack if c.depth_image is not None]
-        
-    batch_size = opt.batch_size
-    
 
+    batch_size = opt.batch_size
     print("data loading done")
+
+    # DataLoader branch
     if opt.dataloader:
         viewpoint_stack = scene.getTrainCameras()
         if opt.custom_sampler is not None:
             sampler = FineSampler(viewpoint_stack)
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=16,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size, sampler=sampler, num_workers=16, collate_fn=list)
             random_loader = False
         else:
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=16,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size, shuffle=True, num_workers=16, collate_fn=list)
             random_loader = True
         loader = iter(viewpoint_stack_loader)
-    
-    
-    # dynerf, zerostamp_init
+
+    # zerostamp init branch 
     if stage == "coarse" and opt.zerostamp_init:
         load_in_memory = True
-        # batch_size = 4
-        temp_list = get_stamp_list(viewpoint_stack,0)
+        temp_list = get_stamp_list(viewpoint_stack, 0)
         viewpoint_stack = temp_list.copy()
     else:
-        load_in_memory = False 
-                            # 
+        load_in_memory = False
+
     count = 0
 
-    for iteration in range(first_iter, final_iter+1):        
-        if network_gui.conn == None:
+    # Main iteration loop
+    for iteration in range(first_iter, final_iter + 1):
+        # GUI handling
+        if network_gui.conn is None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while network_gui.conn is not None:
             try:
                 net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    count +=1
-                    viewpoint_index = (count ) % len(video_cams)
-                    if (count //(len(video_cams))) % 2 == 0:
-                        viewpoint_index = viewpoint_index
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifier = network_gui.receive()
+                if custom_cam is not None:
+                    count += 1
+                    viewpoint_index = (count) % len(video_cams)
+                    if (count // len(video_cams)) % 2 == 0:
+                        pass
                     else:
                         viewpoint_index = len(video_cams) - viewpoint_index - 1
-                    # print(viewpoint_index)
                     viewpoint = video_cams[viewpoint_index]
                     custom_cam.time = viewpoint.time
-                    # print(custom_cam.time, viewpoint_index, count)
-                    net_image = render_with_dynamic_gaussians_mask(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
-
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                    net_image = render_with_dynamic_gaussians_mask(
+                        custom_cam, gaussians, pipe, background, scaling_modifier,
+                        stage=stage, cam_type=scene.dataset_type
+                    )["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, 0, 1) * 255).byte()
+                                              .permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(train_iter)) or not keep_alive) :
+                if do_training and ((iteration < train_iter) or not keep_alive):
                     break
             except Exception as e:
                 print(e)
                 network_gui.conn = None
 
         iter_start.record()
-
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # Increase SH degree occasionally
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-
-        # dynerf's branch
+        # DataLoader fetch
         if opt.dataloader and not load_in_memory:
             try:
                 viewpoint_cams = next(loader)
             except StopIteration:
                 if not random_loader:
                     print("reset dataloader into random dataloader.")
-                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=16,collate_fn=list)
+                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size, shuffle=True, num_workers=16, collate_fn=list)
                     random_loader = True
                 loader = iter(viewpoint_stack_loader)
-
         else:
+            # Manual sampling branch: random sampling without replacement
             idx = 0
             viewpoint_cams = []
-
-            while idx < batch_size :    
-                if not viewpoint_stack :
-                    if len(viewpoint_cams) > 0:
+            while idx < batch_size:
+                if not viewpoint_stack:
+                    if viewpoint_cams:
                         break
-                    else:
-                        # Re initialize the stack from the begining
-                        viewpoint_stack =  temp_list.copy()
-                        
-                viewpoint_cam = viewpoint_stack.pop(0)
-                
+                    viewpoint_stack = temp_list.copy()
+                # Sample a random view from the remaining stack
+                rand_index = randint(0, len(viewpoint_stack) - 1)
+                viewpoint_cam = viewpoint_stack.pop(rand_index)
                 viewpoint_cams.append(viewpoint_cam)
-                idx +=1
-            if len(viewpoint_cams) == 0:
+                idx += 1
+            if not viewpoint_cams:
                 continue
-        # print(len(viewpoint_cams))     
-        # breakpoint()   
-        # Render
+
+        # Debug mode after certain iteration
         if (iteration - 1) == debug_from:
             pipe.debug = True
-            
-        images = []
-        depth_images = []
-        dynamic_depth = []
-        dynamic_image = []
-        dynamic_point_cloud = []
-        gt_images = []
-        gt_depth_images = []
-        gt_dynamic_masks = []
-        gt_dynamic_point_cloud = []
-        radii_list = []
-        visibility_filter_list = []
-        viewspace_point_tensor_list = []
-        
+
+        # Prepare batches of images, depths, etc.
+        images, depth_images, dynamic_depth, dynamic_image = [], [], [], []
+        dynamic_point_cloud, gt_images = [], []
+        gt_depth_images, gt_dynamic_masks = [], []
+        gt_dynamic_point_cloud, radii_list = [], []
+        visibility_filter_list, viewspace_point_tensor_list = [], []
+        median_dist = None
+
         for viewpoint_cam in viewpoint_cams:
-            
             viewpoint_cam.to_device("cuda")
-            
-            # Check if depth available
-            if  viewpoint_cam.depth_image is None:
+            if viewpoint_cam.depth_image is None:
                 continue
 
             if stage == "dynamics_depth":
                 dynamic_point_cloud.append(get_deformed_gaussian_centers(viewpoint_cam, gaussians))
                 gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
                 continue
-            
-            # Render and extract
-            render_pkg = render_with_dynamic_gaussians_mask(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=rendering_only_background_or_only_dynamic)
+            pkg = render_with_dynamic_gaussians_mask(
+                viewpoint_cam, gaussians, pipe, background,
+                stage=stage, cam_type=scene.dataset_type,
+                training=rendering_only_background_or_only_dynamic
+            )
+            image, depth_image = pkg["render"], pkg["depth"]
+            viewspace_point_tensor, visibility_filter, radii = pkg["viewspace_points"], pkg["visibility_filter"], pkg["radii"]
 
-            image, depth_image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            
-            # Should we retrieve gt RGB?
-            if stage == "background_RGB" or stage == "dynamics_RGB" or stage == "fine_coloring":
-                if scene.dataset_type!="PanopticSports":
-                    gt_image = viewpoint_cam.original_image
-                else:
-                    gt_image  = viewpoint_cam['image']
-                
-                images.append(image.unsqueeze(0))
-                gt_images.append(gt_image.unsqueeze(0))
+            # Handle RGB ground truth
+            if stage in ("background_RGB", "dynamics_RGB", "fine_coloring"):
+                gt_image = viewpoint_cam.original_image if scene.dataset_type != "PanopticSports" else viewpoint_cam['image']
+                images.append(image.unsqueeze(0)); gt_images.append(gt_image.unsqueeze(0))
 
+            gt_dynamic_masks.append(viewpoint_cam.dynamic_mask.unsqueeze(0))
+            depth_images.append(depth_image.squeeze().unsqueeze(0)); gt_depth_images.append(viewpoint_cam.depth_image.unsqueeze(0))
 
-            # Get the corresponding dynamic mask
-            gt_dynamic_mask = viewpoint_cam.dynamic_mask
-            gt_dynamic_masks.append(gt_dynamic_mask.unsqueeze(0))
-
-            # Pair the predicted depth and gt depth
-            gt_depth_image  = viewpoint_cam.depth_image
-            depth_images.append(depth_image.squeeze().unsqueeze(0))
-            gt_depth_images.append(gt_depth_image.unsqueeze(0))
-
-            # If we have dynamic only splat and depth, then we are in a stage that requires dynamic depth
-            if render_pkg["dynamic_only_render"] is not None and render_pkg["dynamic_only_depth"] is not None:
-                dynamic_image.append(render_pkg["dynamic_only_render"].unsqueeze(0))
-                dynamic_depth.append(render_pkg["dynamic_only_depth"].squeeze().unsqueeze(0))
-
-                dynamic_point_cloud.append(render_pkg["dynamic_3D_means"].squeeze().cuda())
+            if pkg.get("dynamic_only_render") is not None:
+                dynamic_image.append(pkg["dynamic_only_render"].unsqueeze(0))
+                dynamic_depth.append(pkg["dynamic_only_depth"].squeeze().unsqueeze(0))
+                dynamic_point_cloud.append(pkg["dynamic_3D_means"].squeeze().cuda())
                 gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
-                
 
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
-            
         
         
         # Loss
@@ -306,8 +280,22 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         elif stage == "dynamics_depth":
             dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
         elif stage == "dynamics_RGB":
-            dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
+            dynamic_only_depth_image_tensor = torch.cat(dynamic_depth,0)
+
+            dynamic_mask_loss, median_dist = chamfer_with_median(dynamic_point_cloud, gt_dynamic_point_cloud)
             dynamic_mask_loss = opt.chamfer_weight * dynamic_mask_loss
+
+            
+            # gt_dynamic_masks_tensor has shape (bs, H, W), depth_image_tensor & gt_depth_image_tensor also (bs, H, W)
+            zero_depth = torch.zeros_like(gt_depth_image_tensor)
+            masked_gt_depth = torch.where(
+                gt_dynamic_masks_tensor,        # inside dynamic mask
+                gt_depth_image_tensor,          # keep true depth
+                zero_depth                      # else set to 0
+            )
+            depth_loss = l1_loss(dynamic_only_depth_image_tensor, masked_gt_depth)
+            depth_loss = hyper.general_depth_weight * depth_loss
+
         elif stage == "fine_coloring":
             depth_loss = l1_loss(depth_image_tensor, gt_depth_image_tensor)
 
@@ -317,12 +305,17 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         psnr_ = 0
         if stage != "background_depth" and stage != "dynamics_depth":
             psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
-        # norm
         
-        if stage != "background_depth" and stage != "background_RGB" and hyper.time_smoothness_weight != 0:
-            # tv_loss = 0
-            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-            loss += tv_loss
+        #if stage != "background_depth" and stage != "background_RGB" and hyper.time_smoothness_weight != 0:
+        #    # tv_loss = 0
+        #    tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
+        #    loss += tv_loss
+
+        if stage not in ("background_depth", "background_RGB") and hyper.plane_tv_weight > 0:
+            # Our new “local space‐time TV” on just (XT, YT, ZT) rows that host dynamic Gaussians:
+            local_tv = gaussians.compute_local_spacetime_tv()
+            loss = loss + hyper.plane_tv_weight * local_tv
+
         if stage == "fine_coloring" and opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
@@ -392,7 +385,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             # Densification
             if iteration < opt.densify_until_iter and stage != "dynamics_depth":
                 # Keep track of max radii in image-space for pruning
-                if stage == "dynamics_depth" or stage == "dynamics_RGB":
+                if stage == "dynamics_RGB":
                     combined_mask = gaussians._dynamic_xyz.clone()
                     combined_mask[gaussians._dynamic_xyz] = visibility_filter
                     gaussians.max_radii2D[combined_mask] = torch.max(gaussians.max_radii2D[combined_mask], radii[visibility_filter])
@@ -411,17 +404,18 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     opacity_threshold = opt.opacity_threshold_fine_after
                     densify_threshold = opt.densify_grad_threshold_after
                     
-                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and stage != "fine_coloring":
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    
-                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and stage in ("dynamics_depth", "dynamics_RGB"):
+                    gaussians.densify_dynamic(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist)
+                elif iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist)
+                
                 if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
                     
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
-                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage != "fine_coloring":
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage not in ("dynamics_RGB","fine_coloring"):
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
                     # torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
@@ -516,15 +510,96 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "fine_coloring", tb_writer, using_wandb, training_iters[4], timer, first_iters[4])
         render_set_no_compression(dataset.model_path, "fine_coloring_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
-
-        
+    
     
 
-    #Render by movement
-    distances, colors, opacities = dynamics_by_depth.movement_by_rendering(dataset.model_path, "dynamics", scene.getTrainCameras(), gaussians, pipe, background, cam_type, render_func = render_dynamic_gaussians_mask_and_compare)
-    render_set_no_compression(dataset.model_path, "filtered_color_by_movement", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, override_color = colors, override_opacity = opacities, render_func = render_with_dynamic_gaussians_mask)
+    # —— visibility-based pruning just before final render ——
+    
+    
+    print("Computing per-Gaussian visibility over all training frames…")
+    prune_by_visibility(
+        gaussians,
+        scene.getTrainCameras(),
+        render_with_dynamic_gaussians_mask,
+        pipe,
+        background,
+        cam_type,
+        threshold=0.2  # drop those seen in <20% of frames
+    )
+    '''
+    print("Pruning by average screen‐radius…")
+    prune_by_average_radius(
+        gaussians,
+        scene.getTrainCameras(),
+        render_with_dynamic_gaussians_mask,
+        pipe,
+        background,
+        cam_type,
+        radius_thresh=20
+    )
+    '''
+
 
     render_set_no_compression(dataset.model_path, "final_train_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
+    
+    # Show optinal exocentric camera render
+    # —— static first‐frame view, offset “behind” by 10% —— 
+    if scene.dataset_type == "colmap":
+        orig_views = scene.getTrainCameras()
+        if not orig_views:
+            return
+
+        # 1) Grab first frame’s transform & camera center
+        v0 = orig_views[0]
+        dev = v0.data_device
+        M0 = v0.world_view_transform.to(dev)    # [4×4] world→view
+        P0 = v0.projection_matrix.to(dev)       # [4×4] projection
+        C0 = v0.camera_center.to(dev)           # [3]
+
+        # 2) Compute forward‐world axis (camera looks along –Z in view space)
+        R0 = M0[:3, :3]                         # the 3×3 rotation
+        forward_world = -R0.transpose(0,1)[2]   # column 2 of R0ᵀ, negated
+        forward_world = forward_world / forward_world.norm()
+
+        # 3) Move back by, say, 10% of your scene’s extent
+        dist_back = getattr(scene, "cameras_extent", 1.0) * 2
+        C_back = C0 + forward_world * dist_back
+
+        # 4) Compute new translation t = –R0 · C_back
+        t_back = - (R0 @ C_back)
+
+        # 5) Build the “behind” world→view matrix
+        M_back = M0.clone()
+        M_back[:3, 3] = t_back
+
+        # 6) Apply the same M_back & P0 to *all* views
+        static_views = []
+        for v in orig_views:
+            v.world_view_transform = M_back
+            v.projection_matrix     = P0
+            v.camera_center         = C_back
+            v.full_proj_transform   = (
+                M_back.unsqueeze(0)
+                    .bmm(P0.unsqueeze(0))
+                    .squeeze(0)
+            )
+            static_views.append(v)
+
+        # 7) Render out
+        render_set_no_compression(
+            dataset.model_path,
+            "exocentric_static_offset",
+            total_iters,
+            static_views,
+            gaussians, pipe, background,
+            cam_type=scene.dataset_type,
+            aria=True,
+            render_func=render_with_dynamic_gaussians_mask
+        )
+
+
+
+
     evaluate_single_folder(os.path.join(dataset.model_path, "final_train_render", "ours_{}".format(total_iters)))
     
 def prepare_output_and_logger(expname):    
@@ -635,10 +710,10 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 10001, 14001, 20001, 45001])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 40, 1000, 5000, 10000, 14000, 20000, 30000, 45000, 60000, 100000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 9999, 13999, 19999, 29999])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 999, 4999, 7999, 9999, 13900, 19999, 29999])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[40, 1000, 5000, 10000, 14000, 20000, 30000, 45000, 60000, 100000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[ 999, 4999, 9999, 13900, 19999, 29999])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
@@ -680,10 +755,11 @@ if __name__ == "__main__":
         config = wandb.config
         # Define your experiment name template (you can also hardcode it here or pass it via the config)
         #name_template = "exp_bd{background_depth_iter}_dd{dynamics_depth_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
-        name_template = "exp_backDepth{background_depth_iter}_backRGB{background_RGB_iter}_dynDepth{dynamics_depth_iter}_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamferWeight{chamfer_weight}_fineOptDynLrDownscaler{fine_opt_dyn_lr_downscaler}_colouredBackground"
+        name_template = "alfa_exo_{video_number}_backDepth{background_depth_iter}_backRGB{background_RGB_iter}_dynDepth{dynamics_depth_iter}_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamferWeight{chamfer_weight}_fineOptDynLrDownscaler{fine_opt_dyn_lr_downscaler}_colouredBackground"
 
         # Generate the experiment name using the hyperparameters from the sweep
         experiment_name = name_template.format(
+            video_number = config.source_path.split('/')[-2],
             background_depth_iter = config.background_depth_iter,
             background_RGB_iter = config.background_RGB_iter,
             dynamics_depth_iter = config.dynamics_depth_iter,

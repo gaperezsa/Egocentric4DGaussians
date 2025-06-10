@@ -477,7 +477,7 @@ class GaussianModel:
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = (padded_grad >= grad_threshold) & (~self._dynamic_xyz)
 
         # breakpoint()
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -501,7 +501,126 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, density_threshold=20, displacement_scale=20, model_path=None, iteration=None, stage=None):
+    def densify_and_split_dynamic(
+        self,
+        grads: torch.Tensor,
+        grad_threshold: float,
+        scene_extent: float,
+        N: int = 2,
+        median_dist: float = 0.1,
+        factor: float = 0.1
+    ):
+        """
+        Very‐local, Chamfer‐adaptive splitting of dynamic Gaussians.
+
+        Args:
+            grads (Tensor): 1D tensor of shape (M,) holding per-Gaussian gradient magnitudes.
+            grad_threshold (float): threshold above which to consider splitting.
+            scene_extent (float): used for any additional size checks (unused here).
+            N (int): how many children to spawn per selected parent.
+            median_dist (float): median chamfer distance between all dynamic Gaussians and GT points.
+            factor (float): fraction of median_dist to use as sampling std.
+
+        For each parent Gaussian i where:
+            - grads[i] ≥ grad_threshold, and
+            - parent is marked dynamic, and
+            - parent’s scale > percent_dense * scene_extent
+        we:
+            1) set std = factor * median_dist,
+            2) sample N offsets ∼ N(0, std) in world coords,
+            3) position children = parent_center + offset,
+            4) prune any child whose ‖offset‖ > median_dist,
+            5) copy parent’s features, opacity, scale, rotation, deformation_flag to each surviving child,
+            and mark them dynamic.
+        """
+        device = self._xyz.device
+        n_pts = self.get_xyz.shape[0]
+
+        # 1) Build a full‐length “padded” gradient vector
+        padded = torch.zeros((n_pts,), device=device)
+        # grads might be length M ≤ n_pts; copy into front
+        padded[:grads.shape[0]] = grads.squeeze()
+
+        # 2) Select parents: (grad ≥ thr) AND dynamic AND large enough to split
+        sel = (padded >= grad_threshold) & self._dynamic_xyz
+        sel = sel & (torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+        if not sel.any():
+            return
+
+        # 3) Gather parent data (K = number of selected parents)
+        parent_xyz     = self._xyz[sel]            # [K, 3]
+        parent_scales  = self.get_scaling[sel]     # [K, 3]
+        parent_radius  = torch.max(parent_scales, dim=1).values  # [K]
+
+        K = parent_xyz.shape[0]
+        # If median_dist is zero (unlikely), skip
+        if median_dist <= 1e-9:
+            return
+
+        # 4) Compute global σ and maximum allowed
+        offset_std = median_dist * factor            # a small fraction of median Chamfer distance
+        max_allowed = 2 * median_dist            # children further than this get pruned
+
+        # 5) Sample N children per parent: isotropic world-space
+        #    Total to sample = K * N
+        total_new = K * N
+        # Create a (total_new × 3) tensor of isotropic offsets
+        offsets = torch.normal(
+            mean=torch.zeros((total_new, 3), device=device),
+            std=torch.ones((total_new, 3), device=device) * offset_std
+        )
+        # Repeat each parent center N times → [K*N, 3]
+        centers = parent_xyz.repeat(N, 1)
+
+        candidate_xyz = centers + offsets  # [K*N, 3]
+
+        # 6) Compute each child’s distance from its parent
+        parent_repeated = parent_xyz.repeat(N, 1)  # [K*N, 3]
+        dists = torch.norm(candidate_xyz - parent_repeated, dim=1)  # [K*N]
+
+        # 7) Keep only those within max_allowed
+        keep = (dists <= max_allowed)
+        if not keep.any():
+            return
+
+        new_xyz     = candidate_xyz[keep]                     # [M, 3]
+        new_dynamic = torch.ones(keep.sum(), dtype=torch.bool, device=device)
+
+        # 8) Copy parent attributes, repeated N times, then indexed by keep
+        #    First gather parent tensors (each length K)
+        fe_dc_parent    = self._features_dc[sel]        # [K, F_dc, 1]
+        fe_r_parent     = self._features_rest[sel]      # [K, F_rest, 1]
+        op_parent       = self._opacity[sel]            # [K, 1]
+        sc_parent       = self._scaling[sel]            # [K, 3]
+        rot_parent      = self._rotation[sel]           # [K, 4]
+        def_tbl_parent  = self._deformation_table[sel]  # [K]
+
+        # Helper to repeat each parent entry N times, then mask by keep
+        def repeat_and_keep(x: torch.Tensor):
+            # x.shape = [K, ...]. We want [K*N, ...], repeated along batch dim
+            rep = x.repeat_interleave(N, dim=0)  # [K*N, ...]
+            return rep[keep]
+
+        new_features_dc   = repeat_and_keep(fe_dc_parent)   # [M, F_dc, 1]
+        new_features_rest = repeat_and_keep(fe_r_parent)    # [M, F_rest, 1]
+        new_opacity       = repeat_and_keep(op_parent)      # [M, 1]
+        new_scaling       = repeat_and_keep(sc_parent)      # [M, 3]
+        new_rotation      = repeat_and_keep(rot_parent)     # [M, 4]
+        new_deform_tbl    = repeat_and_keep(def_tbl_parent) # [M]
+
+        # 9) Finally, add them into the Gaussian model
+        self.densification_postfix(
+            new_xyz,
+            new_dynamic,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_deform_tbl
+        )
+
+    def densify_and_clone(self, grads, grad_threshold, scene_extent):
         grads_accum_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
         # 主动增加稀疏点云
@@ -550,20 +669,48 @@ class GaussianModel:
         #     print("write output.")
 
     def spawn_dynamic_gaussians(self, selected_pts_mask=None):
+        # 1) Select a random subset if not provided
         if selected_pts_mask is None:
-            selected_pts_mask = torch.rand(self._xyz.shape[0]) < 0.01
+            selected_pts_mask = torch.rand(self._xyz.shape[0], device=self._xyz.device) < 0.01
         else:
-            assert ( len(selected_pts_mask) == self._xyz.shape[0] )
-        new_xyz = self._xyz[selected_pts_mask]
-        new_dynamic_xyz = torch.ones(selected_pts_mask.sum().item()).type(torch.bool) #mark as dynamic
-        new_features_dc = self._features_dc[selected_pts_mask]
-        new_features_rest = self._features_rest[selected_pts_mask]
-        new_opacities = self._opacity[selected_pts_mask]
-        new_scaling = self._scaling[selected_pts_mask]
-        new_rotation = self._rotation[selected_pts_mask]
-        new_deformation_table = self._deformation_table[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
-    
+            assert len(selected_pts_mask) == self._xyz.shape[0]
+
+        n_new = selected_pts_mask.sum().item()
+        if n_new == 0:
+            return
+
+        # 2) Compute “standard” size & opacity from the existing set
+        #    - median scaling along each axis
+        median_scale = torch.median(self._scaling, dim=0).values  # shape: (3,)
+        #    - maximum opacity
+        max_opacity = self._opacity.max().item()                  # scalar
+
+        # 3) Gather the positions & rotations & features for the selected centers
+        new_xyz            = self._xyz[selected_pts_mask]
+        new_dynamic_xyz    = torch.ones(n_new, dtype=torch.bool, device=self._xyz.device)
+        new_features_dc    = self._features_dc[selected_pts_mask]
+        new_features_rest  = self._features_rest[selected_pts_mask]
+        new_rotation       = self._rotation[selected_pts_mask]
+        new_deformation_tbl= self._deformation_table[selected_pts_mask]
+
+        # 4) Override their scale & opacity to be uniform
+        #    - expand median_scale from (3,) → (n_new, 3)
+        new_scaling = median_scale.unsqueeze(0).repeat(n_new, 1)
+        #    - create an (n_new, 1) tensor at max_opacity
+        new_opacities = torch.full((n_new, 1), max_opacity, device=self._xyz.device)
+
+        # 5) Append them into your model’s buffers
+        self.densification_postfix(
+            new_xyz,
+            new_dynamic_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_deformation_tbl
+        )
+
     @property
     def get_aabb(self):
         return self._deformation.get_aabb
@@ -668,12 +815,24 @@ class GaussianModel:
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
-    def densify(self, max_grad, min_opacity, extent, max_screen_size, density_threshold, displacement_scale, model_path=None, iteration=None, stage=None):
+    def densify(self, max_grad, min_opacity, extent, median_dist=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent, density_threshold, displacement_scale, model_path, iteration, stage)
+        self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
+        if median_dist != None:
+            self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist)
+
+
+    def densify_dynamic(self, max_grad, min_opacity, extent, median_dist):
+        # 1) call self.densify_and_clone but with a small fixed std for dynamic points
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+        # 2) call self.densify_and_split but override the std to e.g. displacement_scale_small
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist)
+
     def standard_constaint(self):
         
         means3D = self._xyz.detach()
@@ -705,6 +864,115 @@ class GaussianModel:
                     if weight.grad.mean() != 0:
                         print(name," :",weight.grad.mean(), weight.grad.min(), weight.grad.max())
         print("-"*50)
+
+    def compute_local_spacetime_tv(self) -> torch.Tensor:
+        """
+        Compute a “local” total‐variation penalty on the XT, YT, and ZT K‐planes,
+        but only for those rows corresponding to dynamic Gaussians.
+
+        Steps:
+        1) Read the axis‐aligned bounding box (aabb) and grid resolution from the underlying K‐Planes:
+            aabb = self._deformation.deformation_net.grid.aabb  # shape [2,3]
+            └─ aabb[0] = [x_max, y_max, z_max]
+            └─ aabb[1] = [x_min, y_min, z_min]
+            grid_cfg = self._deformation.deformation_net.grid.grid_config[0]
+            (res_x, res_y, res_z, res_t) = grid_cfg['resolution']
+        2) Gather canonical (x,y,z) of only the dynamic Gaussians: xyz_dyn = self._xyz[self._dynamic_xyz].
+        3) Quantize each dynamic‐Gaussian coordinate into integer plane‐rows:
+            i_x = round(((x_i − x_min) / (x_max − x_min)) * (res_x − 1)), clamped to [0..res_x−1].
+            Similarly for i_y, i_z.
+        4) Iterate over every multi‐resolution level in self._deformation.deformation_net.grid.grids:
+            • If len(grids) < 6, skip (no time‐planes here).
+            • Otherwise, planes[2] is XT of shape [1, C, res_x, res_t];
+                            planes[4] is YT of shape [1, C, res_y, res_t];
+                            planes[5] is ZT of shape [1, C, res_z, res_t].
+            For each unique i_x among dynamic Gaussians, extract plane_XT[:, i_x, :] → [C, res_t],
+            compute (row[:, t] − row[:, t−1])² summed over t and channels, add to total.
+            Repeat for YT (rows i_y) and ZT (rows i_z).
+        5) Return total TV (a single scalar tensor).
+        """
+        device = self._xyz.device
+
+        # 1) Read AABB and resolution:
+        #    aabb = [[x_max, y_max, z_max],
+        #            [x_min, y_min, z_min]]
+        aabb = self._deformation.deformation_net.grid.aabb  # Parameter of shape [2,3]
+        x_max, y_max, z_max = aabb[0]
+        x_min, y_min, z_min = aabb[1]
+
+        grid_cfg_list = self._deformation.deformation_net.grid.grid_config
+        if not grid_cfg_list:
+            raise RuntimeError("No grid_config found in underlying deformation network.")
+        grid_cfg = grid_cfg_list[0]
+        res_x, res_y, res_z, res_t = grid_cfg['resolution']
+
+        # 2) Which Gaussians are dynamic?
+        dyn_mask = self._dynamic_xyz  # bool mask shape [N_points]
+        if dyn_mask.numel() == 0 or dyn_mask.sum() == 0:
+            # No dynamic Gaussians → zero TV
+            return torch.tensor(0.0, device=device)
+
+        # 3) Canonical centers of dynamic Gaussians:
+        xyz_dyn = self._xyz[dyn_mask]  # [K, 3]
+        xs = xyz_dyn[:, 0]
+        ys = xyz_dyn[:, 1]
+        zs = xyz_dyn[:, 2]
+
+        # Quantization helper: map coordinate ∈ [coord_min..coord_max] → integer index [0..res−1]
+        def quantize(coord: torch.Tensor, c_min: float, c_max: float, res: int) -> torch.LongTensor:
+            # Normalize to [0..1]: (coord − c_min)/(c_max − c_min)
+            denom = (c_max - c_min)
+            if denom == 0:
+                # Degenerate bounding box; all coords equal → map all to 0
+                normalized = torch.zeros_like(coord)
+            else:
+                normalized = (coord - c_min) / denom
+            # Scale to [0..res−1], round, clamp
+            scaled = normalized * (res - 1)
+            idx = scaled.round().long()
+            return torch.clamp(idx, 0, res - 1)
+
+        i_x = quantize(xs, x_min, x_max, res_x)  # [K]
+        i_y = quantize(ys, y_min, y_max, res_y)  # [K]
+        i_z = quantize(zs, z_min, z_max, res_z)  # [K]
+
+        total_tv = torch.tensor(0.0, device=device)
+
+        # 4) Iterate over each multiresolution level in the K‐Planes:
+        multi_res_grids = self._deformation.deformation_net.grid.grids
+        for grids in multi_res_grids:
+            if len(grids) < 6:
+                # fewer than 6 planes → no XT/YT/ZT here
+                continue
+
+            # planes[2] = XT plane: shape [1, C, res_x, res_t]
+            # planes[4] = YT plane: shape [1, C, res_y, res_t]
+            # planes[5] = ZT plane: shape [1, C, res_z, res_t]
+            plane_XT = grids[2].squeeze(0)  # [C, res_x, res_t]
+            plane_YT = grids[4].squeeze(0)  # [C, res_y, res_t]
+            plane_ZT = grids[5].squeeze(0)  # [C, res_z, res_t]
+
+            # XT: for each unique i_x among dynamic Gaussians:
+            for row_x in i_x.unique():
+                row_feats = plane_XT[:, row_x, :]       # [C, res_t]
+                diffs_t   = row_feats[:, 1:] - row_feats[:, :-1]  # [C, res_t−1]
+                total_tv = total_tv + diffs_t.pow(2).sum()
+
+            # YT: for each unique i_y:
+            for row_y in i_y.unique():
+                row_feats = plane_YT[:, row_y, :]       # [C, res_t]
+                diffs_t   = row_feats[:, 1:] - row_feats[:, :-1]  # [C, res_t−1]
+                total_tv = total_tv + diffs_t.pow(2).sum()
+
+            # ZT: for each unique i_z:
+            for row_z in i_z.unique():
+                row_feats = plane_ZT[:, row_z, :]       # [C, res_t]
+                diffs_t   = row_feats[:, 1:] - row_feats[:, :-1]  # [C, res_t−1]
+                total_tv = total_tv + diffs_t.pow(2).sum()
+
+        return total_tv
+
+
     def _plane_regulation(self):
         multi_res_grids = self._deformation.deformation_net.grid.grids
         total = 0
