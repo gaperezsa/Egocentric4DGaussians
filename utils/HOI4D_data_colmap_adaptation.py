@@ -1,204 +1,224 @@
 #!/usr/bin/env python3
-import os
-import argparse
+"""
+1) Decode align_rgb.mp4 + align_depth.avi → PNG frames
+2) Reconstruct & ICP-align raw_pc.pcd into camera world frame
+3) Run COLMAP adaptation (cameras.txt, images.txt, points3D.ply, resized images)
+"""
+import argparse, os, subprocess, shutil
 import numpy as np
 import open3d as o3d
+import cv2
+from PIL import Image
 from copy import copy
 from scipy.spatial.transform import Rotation
-from PIL import Image
-import cv2
+from natsort import natsorted
 
+def decode_video(video_path: str, output_dir: str, fps: int):
+    os.makedirs(output_dir, exist_ok=True)
+    cmd = (
+        f'ffmpeg -i "{video_path}" '
+        f'-f image2 -start_number 0 -vf fps=fps={fps} '
+        f'-qscale:v 2 "{output_dir}/%05d.png" -loglevel quiet'
+    )
+    print(f"Decoding {video_path} @ {fps}fps → {output_dir}")
+    subprocess.run(cmd, shell=True, check=True)
 
-def rotmat2qvec(R):
-    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
-    K = np.array([
-        [Rxx - Ryy - Rzz, 0, 0, 0],
-        [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
-        [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
-        [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz]
-    ]) / 3.0
-    eigvals, eigvecs = np.linalg.eigh(K)
-    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
-    if qvec[0] < 0:
-        qvec *= -1
-    return qvec
+def load_sparse_depths(folder: str):
+    files = sorted(f for f in os.listdir(folder) if f.endswith('.png'))
+    arrs = []
+    for f in files:
+        im = cv2.imread(os.path.join(folder, f), cv2.IMREAD_UNCHANGED)
+        if im is None:
+            raise RuntimeError(f"Cannot read {f} in {folder}")
+        arrs.append(im.astype(np.float32))
+    return arrs  # in mm
 
+def load_trajectory(log_path: str):
+    traj = o3d.io.read_pinhole_camera_trajectory(log_path).parameters
+    print(f"Loaded {len(traj)} camera poses from {log_path}")
+    return traj
 
-def write_cameras_txt(output_folder, K, width, height):
-    cameras_txt_path = os.path.join(output_folder, "cameras.txt")
-    with open(cameras_txt_path, 'w') as f:
-        f.write("# Camera list with one line of data per camera:\n")
-        f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        f.write("1 PINHOLE {} {} {} {} {} {}\n".format(
-            width, height, K[0,0], K[1,1], K[0,2], K[1,2]
-        ))
-    print("Cameras file written to", cameras_txt_path)
+def make_intrinsic(npy_path: str, width: int, height: int):
+    K = np.load(npy_path)
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+    return o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
 
+def reconstruct_scene(traj, intrinsic, rgb_dir, depth_dir, voxel_size):
+    rgb_files  = natsorted(f for f in os.listdir(rgb_dir)   if f.endswith('.png'))
+    depth_maps = load_sparse_depths(depth_dir)
+    assert len(rgb_files) >= len(traj) and len(depth_maps) >= len(traj)
+    all_pts = []
+    for i, cam in enumerate(traj):
+        color = o3d.io.read_image(os.path.join(rgb_dir,   rgb_files[i]))
+        depth = depth_maps[i]  # mm
+        depth_o3d = o3d.geometry.Image(depth.astype(np.uint16))
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color, depth_o3d, depth_scale=1000.0, convert_rgb_to_intensity=False
+        )
+        pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic, cam.extrinsic)
+        pcd = pcd.voxel_down_sample(voxel_size)
+        all_pts.append(np.asarray(pcd.points))
+    recon = o3d.geometry.PointCloud()
+    recon.points = o3d.utility.Vector3dVector(np.vstack(all_pts))
+    recon, _ = recon.remove_statistical_outlier(nb_neighbors=16, std_ratio=0.5)
+    print("Reconstructed scene:", len(recon.points), "points")
+    return recon
 
-def write_images_txt(output_folder, trajectory):
-    images_txt_path = os.path.join(output_folder, "images.txt")
-    with open(images_txt_path, 'w') as f:
-        f.write("# Image list with two lines of data per image:\n")
-        f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME\n")
-        for i, cam in enumerate(trajectory):
-            extrinsic = cam.extrinsic
-            P = copy(extrinsic)
-            R_mat = P[:3, :3]
-            t = P[:3, 3]
-            quat = rotmat2qvec(R_mat)
-            qw, qx, qy, qz = quat
-            image_name = f"camera_rgb_{i:05d}.jpg"
-            f.write("{} {:.12f} {:.12f} {:.12f} {:.12f} {:.12f} {:.12f} {:.12f} 1 {}\n".format(
-                i, qw, qx, qy, qz, t[0], t[1], t[2], image_name
-            ))
-            f.write("\n")
-    print("Images file written to", images_txt_path)
+def run_icp(source, target, max_dist):
+    print("Running ICP…")
+    reg = o3d.pipelines.registration.registration_icp(
+        source, target, max_dist, np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    )
+    print(f"ICP fitness={reg.fitness:.4f} rmse={reg.inlier_rmse:.4f}")
+    return reg.transformation
 
+# ——— COLMAP adaptation helpers —————————————————————
 
 def get_image_shape(path):
     if os.path.isfile(path):
         ext = path.lower()
-        if ext.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        if ext.endswith(('.mp4','.avi','.mov','.mkv')):
             cap = cv2.VideoCapture(path)
-            ret, frame = cap.read()
-            if not ret:
-                raise RuntimeError(f"Cannot read frame from video {path}")
-            h, w = frame.shape[:2]
-            cap.release()
-            return h, w
+            ret, f = cap.read()
+            if not ret: raise RuntimeError(f"Cannot read {path}")
+            h,w = f.shape[:2]; cap.release()
+            return h,w
         else:
-            img = Image.open(path)
-            w, h = img.size
-            return h, w
+            w,h = Image.open(path).size
+            return h,w
     elif os.path.isdir(path):
-        imgs = sorted([f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        if not imgs:
-            raise RuntimeError(f"No images found in folder {path}")
-        img = Image.open(os.path.join(path, imgs[0]))
-        w, h = img.size
-        return h, w
+        imgs = sorted(p for p in os.listdir(path) if p.lower().endswith(('.png','.jpg')))
+        if not imgs: raise RuntimeError(f"No images in {path}")
+        w,h = Image.open(os.path.join(path, imgs[0])).size
+        return h,w
     else:
-        raise RuntimeError(f"Reference path {path} not found")
+        raise RuntimeError(f"{path} not found")
 
+def rotmat2qvec(R):
+    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
+    K = np.array([
+      [Rxx - Ryy - Rzz, 0, 0, 0],
+      [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
+      [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
+      [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz]
+    ])/3.0
+    vals, vecs = np.linalg.eigh(K)
+    q = vecs[[3,0,1,2], np.argmax(vals)]
+    if q[0]<0: q *= -1
+    return q
 
-def load_origin_frames(path):
-    if os.path.isfile(path) and path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-        return 'video', path
-    elif os.path.isfile(path):
-        return 'files', [path]
-    elif os.path.isdir(path):
-        imgs = sorted([f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        return 'files', [os.path.join(path, f) for f in imgs]
-    else:
-        raise RuntimeError(f"Origin path {path} not found")
+def write_cameras_txt(out_folder, K, w, h):
+    p = os.path.join(out_folder, "cameras.txt")
+    with open(p,'w') as f:
+        f.write("# Camera list…\n")
+        f.write("#CAM_ID, MODEL, W, H, PARAMS\n")
+        f.write(f"1 PINHOLE {w} {h} {K[0,0]} {K[1,1]} {K[0,2]} {K[1,2]}\n")
+    print("Wrote", p)
 
+def write_images_txt(out_folder, traj):
+    p = os.path.join(out_folder, "images.txt")
+    with open(p,'w') as f:
+        f.write("# Image list…\n")
+        f.write("#ID, QW, QX, QY, QZ, TX, TY, TZ, CAM_ID, NAME\n")
+        for i,cam in enumerate(traj):
+            P = copy(cam.extrinsic)
+            R, t = P[:3,:3], P[:3,3]
+            qw,qx,qy,qz = rotmat2qvec(R)
+            name = f"camera_rgb_{i:05d}.jpg"
+            f.write(f"{i} {qw:.12f} {qx:.12f} {qy:.12f} {qz:.12f} "
+                    f"{t[0]:.6f} {t[1]:.6f} {t[2]:.6f} 1 {name}\n\n")
+    print("Wrote", p)
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Adapt HOI4D intrinsics/extrinsics and PCD to COLMAP, "
-                    "rescaling intrinsics to a target resolution and generating "
-                    "resized RGB images."
-    )
-    parser.add_argument('--intrinsics', required=True, help='Path to .npy intrinsics file')
-    parser.add_argument('--extrinsics', required=True, help='Path to Open3D pinhole camera trajectory (.log)')
-    parser.add_argument('--pcd', required=True, help='Path to input .pcd point cloud')
-    parser.add_argument('--origin', required=True, help='Path to origin image, folder of images, or .mp4 video')
-    parser.add_argument('--target', help='Path to target image, folder of images, or .mp4 video in order to get the desired shape')
-    parser.add_argument('--target_width', type=int, help='Target width if no --target provided')
-    parser.add_argument('--target_height', type=int, help='Target height if no --target provided')
-    parser.add_argument('--output', required=True, help='Output directory for COLMAP files and images')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(__doc__)
+    p.add_argument("--raw_pcd",     required=True, help='Path to input .pcd point cloud')
+    p.add_argument("--extrinsics",  required=True, help='Path to Open3D pinhole camera trajectory (.log)')
+    p.add_argument("--intrinsics",  required=True, help='Path to .npy intrinsics file')
+    p.add_argument("--rgb_video",   required=True, help='Path to origin image, folder of images, or .mp4 video')
+    p.add_argument("--depth_video", required=True, help='Input sparse-depth AVI file')
+    p.add_argument("--fps",         type=int, default=15)
+    p.add_argument("--target",      help="path to sample image/video for RESOLUTION")
+    p.add_argument("--target_width",  type=int, help="Either this or the target for resolution")
+    p.add_argument("--target_height", type=int, help="Either this or the target for resolution")
+    p.add_argument("--output",      required=True)
+    p.add_argument("--voxel_size",  type=float, default=0.02)
+    p.add_argument("--icp_dist",    type=float, default=1.0)
+    args = p.parse_args()
 
-    os.makedirs(os.path.join(args.output, "sparse", "0"), exist_ok=True)
-    sparse_zero_output = os.path.join(args.output, "sparse", "0")
+    # 1) decode
+    FRGB   = os.path.join(args.output, "rgb_frames")
+    FDEPTH = os.path.join(args.output, "depth_frames")
+    decode_video(args.rgb_video,   FRGB,   args.fps)
+    decode_video(args.depth_video, FDEPTH, args.fps)
 
-    # Determine target resolution
+    # 2) align raw pcd
+    traj  = load_trajectory(args.extrinsics)
+    raw   = o3d.io.read_point_cloud(args.raw_pcd)
+    raw,_ = raw.remove_statistical_outlier(nb_neighbors=16, std_ratio=0.5)
+    # intrinsic from first RGB
+    samp = sorted(os.listdir(FRGB))[0]
+    W,H  = Image.open(os.path.join(FRGB,samp)).size
+    intrinsic = make_intrinsic(args.intrinsics, W, H)
+    recon = reconstruct_scene(traj, intrinsic, FRGB, FDEPTH, args.voxel_size)
+    M = run_icp(recon, raw, args.icp_dist)
+    raw.transform(np.linalg.inv(M))
+    aligned_pcd = os.path.join(args.output, "raw_pc_aligned.pcd")
+    o3d.io.write_point_cloud(aligned_pcd, raw)
+    print(" → Aligned PCD saved to", aligned_pcd)
+
+    # 3) COLMAP‐adaptation
+    SP0 = os.path.join(args.output, "sparse","0")
+    os.makedirs(SP0, exist_ok=True)
+
+    # resolutions
+    origin_h, origin_w = H, W
     if args.target:
         target_h, target_w = get_image_shape(args.target)
     elif args.target_width and args.target_height:
         target_w, target_h = args.target_width, args.target_height
     else:
-        parser.error("Provide --target or both --target_width and --target_height")
+        p.error("Need --target or both --target_width/--target_height")
 
-    # Determine origin resolution
-    origin_h, origin_w = get_image_shape(args.origin)
+    # scale intrinsics
+    K0 = np.load(args.intrinsics)
+    K  = K0.copy()
+    sx, sy = origin_w/target_w, origin_h/target_h
+    K[0,:] /= sx;  K[1,:] /= sy;  K[2,:] = [0,0,1]
 
-    # Compute scale factors
-    sx = origin_w / target_w
-    sy = origin_h / target_h
+    write_cameras_txt(SP0, K, target_w, target_h)
+    write_images_txt(SP0, traj)
 
-    # Load and rescale intrinsics
-    original_K = np.load(args.intrinsics)
-    K = original_K.copy()
-    K[0, :] /= sx
-    K[1, :] /= sy
-    K[2, :] = [0, 0, 1]
-
-    # Load trajectory
-    traj = o3d.io.read_pinhole_camera_trajectory(args.extrinsics).parameters
-    print(f"Loaded {len(traj)} camera poses from extrinsics.")
-
-    # Write COLMAP files
-    write_cameras_txt(sparse_zero_output, K, target_w, target_h)
-    write_images_txt(sparse_zero_output, traj)
-
-    # Read and simplify/convert PCD
-    pcd = o3d.io.read_point_cloud(args.pcd)
-    num_pts = np.asarray(pcd.points).shape[0]
-    if num_pts > 200000:
-        ratio = 200000 / num_pts
-        print(f"Simplifying point cloud from {num_pts} to ~200000 points")
-        pcd = pcd.random_down_sample(ratio)
-    else:
-        print(f"Point cloud has {num_pts} points; no simplification needed")
-
-    # Estimate normals if missing
-    if not pcd.has_normals():
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
-
-    points = np.asarray(pcd.points)
-    colors = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() else np.zeros((points.shape[0], 3), np.uint8)
-    normals = np.asarray(pcd.normals)
-    num_pts = points.shape[0]
-
-    ply_out = os.path.join(sparse_zero_output, "points3D.ply")
-    with open(ply_out, 'w') as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {num_pts}\n")
+    # write points3D.ply
+    pts = np.asarray(raw.points)
+    cnt = pts.shape[0]
+    if cnt>200000:
+        raw = raw.random_down_sample(200000/cnt)
+        print(f"Downsampled from {cnt} → {len(raw.points)} pts")
+    if not raw.has_normals():
+        raw.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+    colors = (np.asarray(raw.colors)*255).astype(np.uint8) if raw.has_colors() else np.zeros((len(raw.points),3),np.uint8)
+    PLY = os.path.join(SP0,"points3D.ply")
+    with open(PLY,'w') as f:
+        f.write("ply\nformat ascii 1.0\nelement vertex %d\n"%len(raw.points))
         f.write("property float x\nproperty float y\nproperty float z\n")
         f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("property float nx\nproperty float ny\nproperty float nz\n")
-        f.write("end_header\n")
-        for i in range(num_pts):
-            x, y, z = points[i]
-            r, g, b = colors[i]
-            nx, ny, nz = normals[i]
-            f.write(f"{x} {y} {z} {r} {g} {b} {nx} {ny} {nz}\n")
-    print(f"Saved point cloud with normals ({num_pts} pts) as PLY at {ply_out}")
+        f.write("property float nx\nproperty float ny\nproperty float nz\nend_header\n")
+        for p, c, n in zip(raw.points, colors, raw.normals):
+            f.write(f"{p[0]} {p[1]} {p[2]} {c[0]} {c[1]} {c[2]} {n[0]} {n[1]} {n[2]}\n")
+    print("Wrote PLY →", PLY)
 
-    # Generate resized RGB images
-    images_out = os.path.join(args.output, "images")
-    os.makedirs(images_out, exist_ok=True)
-    mode, frames = load_origin_frames(args.origin)
-    if mode == 'video':
-        cap = cv2.VideoCapture(frames)
-        for i in range(len(traj)):
-            ret, frame = cap.read()
-            if not ret:
-                raise RuntimeError(f"Video ended before {len(traj)} frames")
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            img = img.resize((target_w, target_h), Image.LANCZOS)
-            img.save(os.path.join(images_out, f"camera_rgb_{i:05d}.jpg"))
-        cap.release()
-    else:
-        if len(frames) < len(traj):
-            raise RuntimeError(f"Not enough origin frames ({len(frames)}) for {len(traj)} camera poses")
-        for i in range(len(traj)):
-            img = Image.open(frames[i])
-            img = img.resize((target_w, target_h), Image.LANCZOS)
-            img.save(os.path.join(images_out, f"camera_rgb_{i:05d}.jpg"))
-    print(f"Resized and saved {len(traj)} images to {images_out}")
+    # 4) resize & dump RGB images
+    IMG_OUT = os.path.join(args.output, "images")
+    os.makedirs(IMG_OUT, exist_ok=True)
+    for i in range(len(traj)):
+        src = os.path.join(FRGB, f"{i:05d}.png")
+        im  = Image.open(src).resize((target_w,target_h), Image.LANCZOS)
+        im.save(os.path.join(IMG_OUT, f"camera_rgb_{i:05d}.jpg"))
+    print(f"Wrote {len(traj)} resized images →", IMG_OUT)
 
-if __name__ == '__main__':
+    shutil.rmtree(FRGB); shutil.rmtree(FDEPTH)
+
+if __name__=="__main__":
     main()

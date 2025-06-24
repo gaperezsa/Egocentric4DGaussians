@@ -11,7 +11,7 @@ def create_video_from_png(folder_path, output_video_path):
     # Print folder name being processed
     print(f"Processing folder: {folder_path}")
     # Search for .png files in the folder
-    png_files = glob.glob(os.path.join(folder_path, '*.jpg'))
+    png_files = glob.glob(os.path.join(folder_path, '*.png'))
     # Sort the list of file paths
     sorted_files = sorted(png_files)
 
@@ -57,6 +57,6 @@ if __name__ == "__main__":
     
 
     # aria
-    folder_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/alfa_exo_Video2_backDepth20000_backRGB20000_dynDepth14000_dynRGB14000_fine20000_chamferWeight51_fineOptDynLrDownscaler0.06665485817411525_colouredBackground/dynamics_RGB_train_render/images"
-    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/alfa_exo_Video2_backDepth20000_backRGB20000_dynDepth14000_dynRGB14000_fine20000_chamferWeight51_fineOptDynLrDownscaler0.06665485817411525_colouredBackground/dynamics_RGB_train_render/video2_dyn_RGB_train.mp4"
+    folder_path = "/home/gperezsantamaria/data/EgoGaussian/data/EgoGaussian-Data/Submission/HOI/Video1/images"
+    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/Video1/EgoGaussian_not_matching_video1_rgb.mp4"
     create_video_from_png(folder_path, output_video_path)

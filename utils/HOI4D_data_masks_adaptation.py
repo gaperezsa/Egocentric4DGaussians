@@ -44,19 +44,19 @@ def main():
         help="Folder containing your PNG segmentation masks"
     )
     parser.add_argument(
-        "--ref_path", "-r", required=True,
+        "--target", "-t", required=True,
         help="Path to a single reference image or a folder of reference images"
     )
     parser.add_argument(
-        "--output_folder", "-o", required=True,
+        "--output", "-o", required=True,
         help="Folder where the resized .npy masks will be saved"
     )
     args = parser.parse_args()
 
-    os.makedirs(args.output_folder, exist_ok=True)
+    os.makedirs(args.output, exist_ok=True)
 
     # Determine target shape once
-    target_h, target_w = get_reference_shape(args.ref_path)
+    target_h, target_w = get_reference_shape(args.target)
 
     # Gather and sort all input masks
     masks = sorted([
@@ -74,7 +74,7 @@ def main():
         resized = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
         out_fn = f"camera_dynamics_{i:05d}.npy"
-        out_path = os.path.join(args.output_folder, out_fn)
+        out_path = os.path.join(args.output, out_fn)
         np.save(out_path, resized)
 
         print(f"[{i:05d}] Saved {out_fn} ({target_w}×{target_h})")

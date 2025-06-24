@@ -117,16 +117,16 @@ def main():
     p.add_argument('--sparse_avi', required=True, help='Input sparse-depth AVI file')
     p.add_argument('--rgb_folder', required=True, help='Folder of RGB images for target size')
     p.add_argument('--relative_folder', required=True, help='Folder of .npy relative-depth outputs')
-    p.add_argument('--output_folder', required=True, help='Where final .png depth maps go')
+    p.add_argument('--output', required=True, help='Where final .png depth maps go')
     p.add_argument('--fps', type=int, default=15, help='FPS for frame extraction')
     p.add_argument('--epochs', type=int, default=5000, help='Epochs for scale/shift opt')
     p.add_argument('--learning_rate', type=float, default=10.0, help='LR for optimizer')
     args = p.parse_args()
     
-    raw_dir = os.path.join(args.output_folder, 'raw_depth_frames')
-    resized_dir = os.path.join(args.output_folder, 'resized_depth_frames')
-    final_dir = os.path.join(args.output_folder, 'depth')
-    resized_rel_dir = os.path.join(args.output_folder, 'resized_relative_depths')
+    raw_dir = os.path.join(args.output, 'raw_depth_frames')
+    resized_dir = os.path.join(args.output, 'resized_depth_frames')
+    final_dir = os.path.join(args.output, 'depth')
+    resized_rel_dir = os.path.join(args.output, 'resized_relative_depths')
 
     # 1) Decode
     decode_video(args.sparse_avi, raw_dir, args.fps)
@@ -140,6 +140,7 @@ def main():
     # 3) Load
     rels = load_relative_depths(resized_rel_dir)
     spars = load_sparse_depths(resized_dir)
+
     n = min(len(rels), len(spars))
     X_list, Y_list = [], []
     for i in range(n):

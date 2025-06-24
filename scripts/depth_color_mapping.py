@@ -19,8 +19,8 @@ def apply_jet_colormap(depth_image):
     return colored_image
 
 # Paths
-depth_folder = '/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/Video1/depth/'  # Path to the folder containing depth images
-output_video = '/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/Video1/HOI4D_depth_video.mp4'  # Output video file
+depth_folder = '/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/officialHOI4DVideo3/depth'  # Path to the folder containing depth images
+output_video = '/home/gperezsantamaria/data/Egocentric4DGaussians/data/HOI4D/officialHOI4DVideo3/HOI4D_depth_video.mp4'  # Output video file
 
 # Get sorted list of images in the folder
 image_files = sorted([f for f in os.listdir(depth_folder) if f.endswith('.png')])

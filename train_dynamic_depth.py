@@ -61,21 +61,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                          gaussians, scene, stage, tb_writer, using_wandb, train_iter, timer, first_iter=0):
 
     # Setup learning rates based on stage
-    if stage == "fine_coloring":
-        modified_optimizer_params = copy.copy(opt)
-        modified_optimizer_params.position_lr_init *= opt.fine_opt_dyn_lr_downscaler
-        modified_optimizer_params.deformation_lr_init *= opt.fine_opt_dyn_lr_downscaler
-        modified_optimizer_params.grid_lr_init *= opt.fine_opt_dyn_lr_downscaler
-        gaussians.training_setup(modified_optimizer_params)
-    elif stage == "dynamics_depth":
-        modified_optimizer_params = copy.copy(opt)
-        modified_optimizer_params.feature_lr = 0
-        modified_optimizer_params.opacity_lr = 0
-        modified_optimizer_params.scaling_lr = 0
-        modified_optimizer_params.rotation_lr = 0
-        gaussians.training_setup(modified_optimizer_params)
-    else:
-        gaussians.training_setup(opt)
+    gaussians.training_setup(opt, stage)
 
     rendering_only_background_or_only_dynamic = stage != "fine_coloring"
     depth_only_stage = stage in ("background_depth", "dynamics_depth")
@@ -326,7 +312,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
             os.execv(sys.executable, [sys.executable] + sys.argv)
-
         loss.backward()
 
         #kill grad of no dynamic gaussians
@@ -367,12 +352,12 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                         or (iteration < 60000 and iteration %  1000 == 999) \
                             or (iteration < 200000 and iteration %  2000 == 1999) :
                             # breakpoint()
-                            render_training_image(scene, gaussians, [test_cams[500%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [test_cams[0%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
                             #render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
                             if stage == "dynamics_depth":
                                 render_base_path = os.path.join(scene.model_path, f"{stage}_render")
                                 image_path = os.path.join(render_base_path,"images")
-                                render_pkg = render_with_dynamic_gaussians_mask(train_cams[500%len(train_cams)], gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=True)
+                                render_pkg = render_with_dynamic_gaussians_mask(train_cams[0%len(train_cams)], gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=True)
                                 torchvision.utils.save_image((render_pkg["dynamic_only_depth"] > 0).detach().cpu().float(), render_base_path+f"_dyn_splat_{iteration}.png")
 
                             # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
@@ -755,7 +740,7 @@ if __name__ == "__main__":
         config = wandb.config
         # Define your experiment name template (you can also hardcode it here or pass it via the config)
         #name_template = "exp_bd{background_depth_iter}_dd{dynamics_depth_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
-        name_template = "alfa_exo_{video_number}_backDepth{background_depth_iter}_backRGB{background_RGB_iter}_dynDepth{dynamics_depth_iter}_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamferWeight{chamfer_weight}_fineOptDynLrDownscaler{fine_opt_dyn_lr_downscaler}_colouredBackground"
+        name_template = "BASELINE_{video_number}_backDepth{background_depth_iter}_backRGB{background_RGB_iter}_dynDepth{dynamics_depth_iter}_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamferWeight{chamfer_weight}_fineOptDynLrDownscaler{fine_opt_dyn_lr_downscaler}_colouredBackground"
 
         # Generate the experiment name using the hyperparameters from the sweep
         experiment_name = name_template.format(
