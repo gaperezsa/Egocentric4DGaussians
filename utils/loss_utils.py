@@ -27,8 +27,12 @@ def l1_proximity_loss(network_output, gt, max=1):
     close_filter = gt[gt<max]
     return torch.abs((network_output[close_filter] - gt[close_filter])).mean()
 
-def l1_filtered_loss(network_output, gt, mask):
-    return torch.abs((network_output[mask] - gt[mask])).mean()
+def l1_filtered_loss(network_output, gt, mask, reduction="mean"):
+    if reduction == "mean":
+        return torch.abs((network_output[mask] - gt[mask])).mean()
+    elif reduction == "sum":
+        return torch.abs((network_output[mask] - gt[mask])).sum()
+
 
 def l1_background_colored_masked_loss(network_output, gt, mask, background_color):
     '''

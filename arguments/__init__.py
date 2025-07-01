@@ -115,8 +115,10 @@ class OptimizationParams(ParamGroup):
         self.background_RGB_iterations = 10_000
         self.dynamics_depth_iterations = 10_000
         self.fine_iterations = 10_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
+        self.dynamic_position_lr_init = 0.0016,
+        self.dynamic_position_lr_final = 0.00016,
+        self.static_position_lr_init = 0.016,
+        self.static_position_lr_final = 0.000016,
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 20_000
         self.deformation_lr_init = 0.00016

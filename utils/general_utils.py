@@ -18,6 +18,12 @@ import random
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
+# 2 being an arbitrary scalar to make the sigmoid used for gaussian opacity steeper, more decisive
+def steep_sigmoid(x):
+        return torch.sigmoid(2*x)
+def inv_steep_sigmoid(x):
+        return -torch.log((1/x)-1)/2
+
 def PILtoTorch(pil_image, resolution):
     if resolution is not None:
         resized_image_PIL = pil_image.resize(resolution)

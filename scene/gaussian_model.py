@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, steep_sigmoid, inv_steep_sigmoid
 from torch import nn
 import os
 import open3d as o3d
@@ -38,14 +38,9 @@ class GaussianModel:
         self.scaling_inverse_activation = torch.log
 
         self.covariance_activation = build_covariance_from_scaling_rotation
-
-        def steep_sigmoid(x):
-            return torch.sigmoid(x)
-        def inv_steep_sigmoid(x):
-            return inverse_sigmoid(x)
         
         self.opacity_activation = steep_sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
+        self.inverse_opacity_activation = inv_steep_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
 
@@ -94,7 +89,7 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args, stage):
         (self.active_sh_degree, 
         self._xyz,
         self._dynamic_xyz,
@@ -114,7 +109,7 @@ class GaussianModel:
         self.spatial_lr_scale) = model_args
         self._deformation.load_state_dict(deform_state)
         if training_args is not None:
-            self.training_setup(training_args)
+            self.training_setup(training_args, stage)
             self.xyz_gradient_accum = xyz_gradient_accum
             self.denom = denom
             self.optimizer.load_state_dict(opt_dict)
@@ -168,7 +163,7 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inv_steep_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._dynamic_xyz = torch.zeros(self._xyz.shape[0]).type(torch.bool).to(self._xyz.device)
@@ -195,10 +190,28 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
+        self._lr_static  = training_args.static_position_lr_init*self.spatial_lr_scale
+        self._lr_dynamic = training_args.dynamic_position_lr_init*self.spatial_lr_scale
+
+        def _dynamic_grad_hook(grad):
+            # grad: [N, 3]
+            m = self._dynamic_xyz.view(-1,1).to(grad.device)  # [N,1]
+            # broadcast: dynamic rows get dynamic LR, static get static LR
+            return grad * (m * self._lr_dynamic + (~m) * self._lr_static)
         
         if stage in ("background_depth","background_RGB"):
+
+            # 1) sanity check
+            N = self._xyz.shape[0]
+            assert self._dynamic_xyz.shape[0] == N, \
+                f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
+
+            # Register hook
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
+
             l = [
-                {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "background_xyz"},
+                {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': 0, "name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()), 'lr': 0, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -208,8 +221,12 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
             max_steps = max(training_args.position_lr_max_steps, training_args.background_RGB_iterations, training_args.background_depth_iterations)
-            self.background_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.static_position_lr_init * self.spatial_lr_scale,
+                                                    lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=max_steps)
+            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
+                                                    lr_final=0,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
             self.deformation_scheduler_args = get_expon_lr_func(lr_init=0,
@@ -228,20 +245,12 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # 2) Install a hook function which adapts to the size of the dynamic mask
-            def _dynamic_grad_hook(grad):
-                # grad: [N, 3]
-                m = self._dynamic_xyz.view(-1, 1).to(grad.device).to(grad.dtype)  # [N,1]
-                return grad * m   # zero out any grads where m==0
+            # Register hook
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
 
-            # Only register once per Parameter object
-            if not getattr(self._xyz, "_has_dynamic_hook", False):
-                self._xyz.register_hook(_dynamic_grad_hook)
-                self._xyz._has_dynamic_hook = True
-
-            # now safe to index
             l = [
-                {'params': [self._xyz],'lr': training_args.position_lr_init * self.spatial_lr_scale,"name": "dynamic_xyz"},
+                {'params': [self._xyz],'lr': 1.0,"name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()),'lr': training_args.deformation_lr_init * self.spatial_lr_scale,"name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()),'lr': training_args.grid_lr_init * self.spatial_lr_scale,"name": "grid"},
                 {'params': [self._features_dc],   'lr': 0, "name": "f_dc"},
@@ -251,8 +260,12 @@ class GaussianModel:
                 {'params': [self._rotation],      'lr': 0, "name": "rotation"},
             ]
             max_steps = max(training_args.position_lr_max_steps, training_args.dynamics_depth_iterations)
-            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
+                                                    lr_final=0,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=max_steps)
+            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.dynamic_position_lr_init*self.spatial_lr_scale,
+                                                    lr_final=training_args.dynamic_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
             self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
@@ -271,19 +284,11 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # 2) Install a hook function which adapts to the size of the dynamic mask
-            def _dynamic_grad_hook(grad):
-                # grad: [N, 3]
-                m = self._dynamic_xyz.view(-1, 1).to(grad.device).to(grad.dtype)  # [N,1]
-                return grad * m   # zero out any grads where m==0
-
-            # Only register once per Parameter object
-            if not getattr(self._xyz, "_has_dynamic_hook", False):
-                self._xyz.register_hook(_dynamic_grad_hook)
-                self._xyz._has_dynamic_hook = True
-
+            # Register hook
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
             l = [
-                {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "dynamic_xyz"},
+                {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -293,8 +298,12 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
             max_steps = max(training_args.position_lr_max_steps, training_args.dynamics_RGB_iterations)
-            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
+                                                    lr_final=0,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=max_steps)
+            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.dynamic_position_lr_init*self.spatial_lr_scale*training_args.fine_opt_dyn_lr_downscaler,
+                                                    lr_final=training_args.dynamic_position_lr_final*self.spatial_lr_scale*training_args.fine_opt_dyn_lr_downscaler,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
             self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
@@ -308,8 +317,18 @@ class GaussianModel:
 
 
         elif stage == "fine_coloring":
+
+            # 1) sanity check
+            N = self._xyz.shape[0]
+            assert self._dynamic_xyz.shape[0] == N, \
+                f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
+
+            # Register hook
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
+
             l = [
-                {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler, "name": "dynamic_xyz"},
+                {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler, "name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -319,12 +338,12 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
             max_steps = max(training_args.position_lr_max_steps, training_args.fine_iterations)
-            self.background_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final * self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.static_position_lr_init * self.spatial_lr_scale,
+                                                    lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
-            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler,
-                                                    lr_final=training_args.position_lr_final * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler,
+            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.dynamic_position_lr_init*self.spatial_lr_scale,
+                                                    lr_final=training_args.dynamic_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
             self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler,
@@ -343,13 +362,9 @@ class GaussianModel:
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "background_xyz":
-                lr = self.background_xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                # return lr
-            if param_group["name"] == "dynamic_xyz":
-                lr = self.dynamic_xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
+            if param_group["name"] == "xyz":
+                self._lr_static  = self.static_xyz_scheduler_args(iteration)
+                self._lr_dynamic = self.dynamic_xyz_scheduler_args(iteration)
             if  "grid" in param_group["name"]:
                 lr = self.grid_scheduler_args(iteration)
                 param_group['lr'] = lr
@@ -417,7 +432,7 @@ class GaussianModel:
         PlyData([el]).write(path)
         
     def reset_opacity(self):
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        opacities_new = inv_steep_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -581,10 +596,12 @@ class GaussianModel:
 
         # 7) If we had a hook, re‐install it now
         if had_hook:
-            self._xyz._has_dynamic_hook = False
+            # re‐register the hook
             def _dynamic_grad_hook(grad):
-                m = self._dynamic_xyz.view(-1,1).to(grad.device).to(grad.dtype)
-                return grad * m
+                # grad: [N, 3]
+                m = self._dynamic_xyz.view(-1,1).to(grad.device)  # [N,1]
+                # broadcast: dynamic rows get dynamic LR, static get static LR
+                return grad * (m * self._lr_dynamic + (~m) * self._lr_static)
             self._xyz.register_hook(_dynamic_grad_hook)
             self._xyz._has_dynamic_hook = True
 
@@ -618,88 +635,99 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self,
-        new_xyz: torch.Tensor,
-        new_dynamic_xyz: torch.Tensor,
-        new_features_dc: torch.Tensor,
-        new_features_rest: torch.Tensor,
-        new_opacities: torch.Tensor,
-        new_scaling: torch.Tensor,
-        new_rotation: torch.Tensor,
-        new_deformation_table: torch.Tensor
-    ):
-        # 0) Remember if we already had the dynamic hook on _xyz
+    def densification_postfix(
+    self,
+    new_xyz: torch.Tensor,
+    new_dynamic_xyz: torch.Tensor,
+    new_features_dc: torch.Tensor,
+    new_features_rest: torch.Tensor,
+    new_opacities: torch.Tensor,
+    new_scaling: torch.Tensor,
+    new_rotation: torch.Tensor,
+    new_deformation_table: torch.Tensor
+):
+        
+        
+        # 0) remember if there was a per‐point hook on self._xyz
         had_hook = getattr(self._xyz, "_has_dynamic_hook", False)
 
-        # 1) Expand optimizer state exactly as before
+        # 1) prepare the extension dict for _all_ unified buffers
         d = {
-        "dynamic_xyz":    new_xyz[new_dynamic_xyz],
-        "background_xyz": new_xyz[~new_dynamic_xyz],
-        "f_dc":           new_features_dc,
-        "f_rest":         new_features_rest,
-        "opacity":        new_opacities,
-        "scaling":        new_scaling,
-        "rotation":       new_rotation,
+            "xyz":      new_xyz,
+            "f_dc":     new_features_dc,
+            "f_rest":   new_features_rest,
+            "opacity":  new_opacities,
+            "scaling":  new_scaling,
+            "rotation": new_rotation,
         }
+        # this will extend each param_group by concatenating the extension_tensor
         self.cat_tensors_to_optimizer(d)
 
-        # 2) Append & re-wrap every Parameter buffer
+        # 2) actually cat & re‐wrap each Parameter so we maintain leaf‐ness + hooks
+        dev = self._xyz.device
 
-        # xyz
+        # -- xyz --
         cat_xyz = torch.cat([self._xyz.data, new_xyz], dim=0)
         self._xyz = nn.Parameter(cat_xyz, requires_grad=True)
 
-        # features_dc
+        # -- features dc --
         cat_fdc = torch.cat([self._features_dc.data, new_features_dc], dim=0)
         self._features_dc = nn.Parameter(cat_fdc, requires_grad=True)
 
-        # features_rest
+        # -- features rest --
         cat_frest = torch.cat([self._features_rest.data, new_features_rest], dim=0)
         self._features_rest = nn.Parameter(cat_frest, requires_grad=True)
 
-        # opacity
+        # -- opacity --
         cat_op = torch.cat([self._opacity.data, new_opacities], dim=0)
         self._opacity = nn.Parameter(cat_op, requires_grad=True)
 
-        # scaling
+        # -- scaling --
         cat_sc = torch.cat([self._scaling.data, new_scaling], dim=0)
         self._scaling = nn.Parameter(cat_sc, requires_grad=True)
 
-        # rotation
+        # -- rotation --
         cat_rot = torch.cat([self._rotation.data, new_rotation], dim=0)
         self._rotation = nn.Parameter(cat_rot, requires_grad=True)
 
-        # deformation_table & dynamic_xyz (plain tensors)
+        # 3) plain‐tensor buffers
         self._deformation_table = torch.cat([self._deformation_table, new_deformation_table], dim=0)
         self._dynamic_xyz       = torch.cat([self._dynamic_xyz,       new_dynamic_xyz],       dim=0)
 
-        # 3) Zero‐pad accumulators
-        M = new_xyz.shape[0]
-        dev = self._xyz.device
-        self.xyz_gradient_accum = torch.cat([self.xyz_gradient_accum,
-                                            torch.zeros((M,1), device=dev)], dim=0)
-        self._deformation_accum = torch.cat([self._deformation_accum,
-                                            torch.zeros((M,3), device=dev)], dim=0)
-        self.denom              = torch.cat([self.denom,
-                                            torch.zeros((M,1), device=dev)], dim=0)
-        self.max_radii2D        = torch.cat([self.max_radii2D,
-                                            torch.zeros((M,),  device=dev)], dim=0)
+        # 4) zero‐pad your accumulators
+        M = new_xyz.size(0)
+        self.xyz_gradient_accum = torch.cat([
+            self.xyz_gradient_accum,
+            torch.zeros((M,1), device=dev)
+        ], dim=0)
+        self._deformation_accum = torch.cat([
+            self._deformation_accum,
+            torch.zeros((M,3), device=dev)
+        ], dim=0)
+        self.denom            = torch.cat([
+            self.denom,
+            torch.zeros((M,1), device=dev)
+        ], dim=0)
+        self.max_radii2D      = torch.cat([
+            self.max_radii2D,
+            torch.zeros((M,), device=dev)
+        ], dim=0)
 
-        # 4) If we had installed the dynamic hook, re‐install it now
+        # 5) if there was a learning‐rate hook, re‐install it on the new self._xyz
         if had_hook:
-            # clear previous flag on old tensor
-            self._xyz._has_dynamic_hook = False
-            # re‐register the hook
             def _dynamic_grad_hook(grad):
-                m = self._dynamic_xyz.view(-1,1).to(grad.device).to(grad.dtype)
-                return grad * m
+                # grad: [N, 3]
+                m = self._dynamic_xyz.view(-1,1).to(grad.device)  # [N,1]
+                # broadcast: dynamic rows get dynamic LR, static get static LR
+                return grad * (m * self._lr_dynamic + (~m) * self._lr_static)
             self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
+            self._xyz._lr_hook_installed = True
 
 
 
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=10):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -734,7 +762,7 @@ class GaussianModel:
         grads: torch.Tensor,
         grad_threshold: float,
         scene_extent: float,
-        N: int = 2,
+        N: int = 10,
         median_dist: float = 0.1,
         factor: float = 0.1
     ):
@@ -1049,9 +1077,11 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        
         if median_dist != None:
             self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist)
+        else:
+            self.densify_and_split(grads, max_grad, extent)
 
 
     def densify_dynamic(self, max_grad, min_opacity, extent, median_dist):

@@ -65,7 +65,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
     rendering_only_background_or_only_dynamic = stage != "fine_coloring"
     depth_only_stage = stage in ("background_depth", "dynamics_depth")
-    hyper.general_depth_weight = 0.5  # temporary weight
+    hyper.general_depth_weight = 1e-5 # temporary weight
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -259,9 +259,13 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
         # Depth and depth-related losses
         if stage == "background_depth":
-            depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
+            if iteration < opt.densify_from_iter:
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor, reduction="mean")
+            else:
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor, reduction="sum")
+                depth_loss = hyper.general_depth_weight * depth_loss
         elif stage == "background_RGB":
-            depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor)
+            depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor, reduction="sum")
             depth_loss = hyper.general_depth_weight * depth_loss
         elif stage == "dynamics_depth":
             dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
@@ -389,9 +393,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     opacity_threshold = opt.opacity_threshold_fine_after
                     densify_threshold = opt.densify_grad_threshold_after
                     
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and stage in ("dynamics_depth", "dynamics_RGB"):
-                    gaussians.densify_dynamic(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist)
-                elif iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist)
                 
                 if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
@@ -442,7 +444,7 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
         for i, st in enumerate(stages):
             if st in checkpoint.split("/")[-1]:
                 (model_params, first_iter) = torch.load(checkpoint)
-                gaussians.restore(model_params, opt)
+                gaussians.restore(model_params, opt, st)
 
                 #Check the checkpoint iters is not far from the set iters, if so, just load and continue from the next stage
                 if first_iter < training_iters[i] and abs(first_iter/(training_iters[i]+1)) < 0.9:
