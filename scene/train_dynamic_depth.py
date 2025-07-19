@@ -10,7 +10,6 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import numpy as np  # numerical operations
-import math
 import random       # random sampling
 import os, sys
 import torch
@@ -34,7 +33,7 @@ from torchvision import transforms
 from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
 import lpips
-from utils.scene_utils import render_training_image, debug_render_training_image_by_mask
+from utils.scene_utils import render_training_image
 from utils.render_utils import prune_by_visibility, prune_by_average_radius, look_at
 from time import time
 import copy
@@ -373,10 +372,8 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
 
             # Densification
-            if (iteration > opt.densify_from_iter or iteration > opt.pruning_from_iter) and stage != "dynamics_depth":
-                
+            if iteration < opt.densify_until_iter and stage != "dynamics_depth":
                 # Keep track of max radii in image-space for pruning
-                # Keeping track of densification stats
                 if stage == "dynamics_RGB":
                     combined_mask = gaussians._dynamic_xyz.clone()
                     combined_mask[gaussians._dynamic_xyz] = visibility_filter
@@ -386,7 +383,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
 
-                # Defining thresholds for pruning and densifying
                 if depth_only_stage:
                     opacity_threshold = opt.opacity_threshold_coarse
                     densify_threshold = opt.densify_grad_threshold_coarse
@@ -396,60 +392,43 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 else:
                     opacity_threshold = opt.opacity_threshold_fine_after
                     densify_threshold = opt.densify_grad_threshold_after
-                
-                # Densify if in the middle of training
-                if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter and iteration < int(0.8 * final_iter) and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
+                    
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist)
                 
-                # prune
-                if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
+                if iteration > opt.pruning_from_iter and iteration+50% opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
+
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
                     #1) find & count outlier Gaussians on the last batch
                     gaussians.find_outlier_gaussians_and_update_hits(
                         viewpoint_cams,               # list of view cameras
                         depth_image_tensor,           # [B,H,W]
                         gt_depth_image_tensor,        # [B,H,W]
-                        error_thresh_cm = 0.05,       # e.g. 0.05
-                        topk_percent    = None,        # e.g. 0.10
-                        search_radius   = None        # or some world-space radius
+                        error_thresh_cm = 0.05,   # e.g. 0.10
+                        topk_percent    = None,   # e.g. 0.05
+                        search_radius   = None                     # or some world-space radius
                     )
 
-                    ## FOR PRUNE DEBUGGGING PURPOSES ##
-
-                    # compute the mask *without* actually pruning:
-                    mask = gaussians.compute_prune_mask(
-                        opacity_threshold,
-                        max_scale = opt.scale_pruning_factor * scene.cameras_extent,
-                        max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2) ),
-                        max_outlier_hits = 3  # e.g. 3
-                    )
-
-                    # Dump a debug image showing ONLY those Gaussians:
-                    debug_render_training_image_by_mask(
-                        scene, gaussians, [test_cams[0]],
-                        render_with_dynamic_gaussians_mask,
-                        mask, pipe, background,
-                        stage, iteration,
-                        timer.get_elapsed_time(), scene.dataset_type
-                    )
-                    ####################################
-
-
-                    # 2) prune using all opacity + scale + image_size + depth outlier-hits
+                    # 2) prune using all opacity + size + outlier-hits
                     gaussians.prune(
+                        densify_threshold,
                         opacity_threshold,
-                        max_scale = opt.scale_pruning_factor * scene.cameras_extent,
-                        max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2) ),
-                        max_outlier_hits = 3  # e.g. 3
+                        scene.cameras_extent,
+                        size_threshold,
+                        max_outlier_hits = 1  # e.g. 3
                     )
-                    print(f"pruning in iter:{iteration}")
                     
+                    
+                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                 if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage not in ("dynamics_RGB","fine_coloring"):
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
-                    print(f"growing in iter:{iteration}")
+                    # torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
+                    print("reset opacity")
                     gaussians.reset_opacity()
-                    print(f"reseting opacity in iter:{iteration}")
+                    
+            
 
             # Optimizer step
             if iteration < train_iter:
@@ -706,9 +685,6 @@ def training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_
                 if using_wandb:
                     wandb.log({f"{stage}/{config['name']}/loss_viewpoint - l1_loss": l1_test})
                     wandb.log({f"{stage}/{config['name']}/loss_viewpoint - psnr": psnr_test})
-                    if stage in ("background_RGB", "dynamics_RGB") and psnr_test < 17:
-                        print(f"tested in iteration {iteration} on stage {stage} and got a PSNR of {psnr_test}, stopping early in order to start next run ")
-                        sys.exit(0)
 
 
         if tb_writer:
@@ -740,7 +716,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 999, 4999, 9999])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 9999, 13999, 19999, 29999])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 999, 4999, 7999, 9999, 13900, 19999, 29999])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[ 999, 4999, 9999, 13900, 19999, 29999])
@@ -748,7 +724,8 @@ if __name__ == "__main__":
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
     parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
-    parser.add_argument("--bs", type=int, default = 16)
+    parser.add_argument('--chamfer_weight', type=float, default=50.0)
+    parser.add_argument('--fine_opt_dyn_lr_downscaler', type=float, default=0.01)
 
     # grid_searched hyperparams
     parser.add_argument("--wandb", action="store_true")
@@ -758,16 +735,7 @@ if __name__ == "__main__":
     parser.add_argument("--dynamics_RGB_iter", type=int, default = 5000)
     parser.add_argument("--fine_iter", type=int, default = 20000)
     parser.add_argument("--netork_width", type=int, default = 128)
-    
-    parser.add_argument('--chamfer_weight', type=float, default=50.0)
-    parser.add_argument('--fine_opt_dyn_lr_downscaler', type=float, default=0.01)
-    #parser.add_argument('--pruning_interval', type=float, default=0.01)
-    #parser.add_argument('--densification_interval', type=float, default=0.01)
-    #parser.add_argument('--dynamic_position_lr_init', type=float, default=1e-13)
-    #parser.add_argument('--dynamic_position_lr_final', type=float, default=1e-15)
-    #parser.add_argument('--static_position_lr_init', type=float, default=1e-13)
-    #parser.add_argument('--static_position_lr_final', type=float, default=1e-15)
-
+    parser.add_argument("--bs", type=int, default = 16)
 
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -793,9 +761,7 @@ if __name__ == "__main__":
         config = wandb.config
         # Define your experiment name template (you can also hardcode it here or pass it via the config)
         #name_template = "exp_bd{background_depth_iter}_dd{dynamics_depth_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
-        name_template = "BASELINE_{video_number}_BD{background_depth_iter}_BRGB{background_RGB_iter}_DD{dynamics_depth_iter}_DRGB{dynamics_RGB_iter}_fine{fine_iter}" \
-                        "_startStaticLR{static_position_lr_init:.3f}_startDynamicLR{dynamic_position_lr_init:.3f}" \
-                        "_pruneInterval{pruning_interval}_densifyInterval{densification_interval}"
+        name_template = "BASELINE_{video_number}_backDepth{background_depth_iter}_backRGB{background_RGB_iter}_dynDepth{dynamics_depth_iter}_dynRGB{dynamics_RGB_iter}_fine{fine_iter}_chamferWeight{chamfer_weight}_fineOptDynLrDownscaler{fine_opt_dyn_lr_downscaler}_colouredBackground"
 
         # Generate the experiment name using the hyperparameters from the sweep
         experiment_name = name_template.format(
@@ -805,10 +771,8 @@ if __name__ == "__main__":
             dynamics_depth_iter = config.dynamics_depth_iter,
             dynamics_RGB_iter = config.dynamics_RGB_iter,
             fine_iter = config.fine_iter,
-            static_position_lr_init = config.static_position_lr_init,
-            dynamic_position_lr_init = config.dynamic_position_lr_init,
-            pruning_interval = config.pruning_interval,
-            densification_interval = config.densification_interval,
+            chamfer_weight = config.chamfer_weight,
+            fine_opt_dyn_lr_downscaler = config.fine_opt_dyn_lr_downscaler
         )
 
         # Optionally, update the run name in wandb
@@ -835,12 +799,6 @@ if __name__ == "__main__":
     op_params.batch_size =  args.bs
     op_params.chamfer_weight = args.chamfer_weight
     op_params.fine_opt_dyn_lr_downscaler = args.fine_opt_dyn_lr_downscaler
-    op_params.pruning_interval = args.pruning_interval
-    op_params.densification_interval = args.densification_interval
-    op_params.dynamic_position_lr_init = args.dynamic_position_lr_init
-    op_params.dynamic_position_lr_final = args.dynamic_position_lr_final
-    op_params.static_position_lr_init = args.static_position_lr_init
-    op_params.static_position_lr_final = args.static_position_lr_final
 
     hp_params = hp.extract(args)
     if type(hp_params.multires) == type(list()) and type(hp_params.multires[0]) == type(str()):

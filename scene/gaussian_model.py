@@ -25,6 +25,8 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 # from utils.point_utils import addpoint, combine_pointcloud, downsample_point_cloud_open3d, find_indices_in_A
 from scene.deformation import deform_network
 from scene.regulation import compute_plane_smoothness
+from sklearn.neighbors import KDTree
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -61,6 +63,7 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.depth_outlier_hits = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -85,6 +88,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self.depth_outlier_hits,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -105,6 +109,7 @@ class GaussianModel:
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
+        depth_outlier_hits,
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self._deformation.load_state_dict(deform_state)
@@ -112,6 +117,7 @@ class GaussianModel:
             self.training_setup(training_args, stage)
             self.xyz_gradient_accum = xyz_gradient_accum
             self.denom = denom
+            self.depth_outlier_hits = depth_outlier_hits
             self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -189,6 +195,7 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.depth_outlier_hits = torch.zeros((self.get_xyz.shape[0],1), dtype=torch.int64, device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
         self._lr_static  = training_args.static_position_lr_init*self.spatial_lr_scale
         self._lr_dynamic = training_args.dynamic_position_lr_init*self.spatial_lr_scale
@@ -200,15 +207,17 @@ class GaussianModel:
             return grad * (m * self._lr_dynamic + (~m) * self._lr_static)
         
         if stage in ("background_depth","background_RGB"):
-
             # 1) sanity check
             N = self._xyz.shape[0]
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook
-            self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
+            # Register hook if not already existing
+            # Remember if we already had the dynamic hook
+            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
+            if not has_hook:
+                self._xyz.register_hook(_dynamic_grad_hook)
+                self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
@@ -245,9 +254,12 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook
-            self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
+            # Register hook if not already existing
+            # Remember if we already had the dynamic hook
+            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
+            if not has_hook:
+                self._xyz.register_hook(_dynamic_grad_hook)
+                self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz],'lr': 1.0,"name": "xyz"},
@@ -284,9 +296,13 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook
-            self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
+            # Register hook if not already existing
+            # Remember if we already had the dynamic hook
+            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
+            if not has_hook:
+                self._xyz.register_hook(_dynamic_grad_hook)
+                self._xyz._has_dynamic_hook = True
+
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
@@ -323,10 +339,12 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook
-            self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
-
+            # Register hook if not already existing
+            # Remember if we already had the dynamic hook
+            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
+            if not has_hook:
+                self._xyz.register_hook(_dynamic_grad_hook)
+                self._xyz._has_dynamic_hook = True
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler, "name": "deformation"},
@@ -508,20 +526,7 @@ class GaussianModel:
 
             name      = group["name"]
             old_param = group["params"][0]
-            M         = old_param.shape[0]
-
-            # pick the exact slice
-            if   M == total:     submask = keep_mask
-            elif M == dyn_count: submask = keep_mask[dyn_mask]
-            elif M == bg_count:  submask = keep_mask[~dyn_mask]
-            elif M == surv_count:
-                # already matches post-prune survivors
-                submask = torch.ones((M,), dtype=torch.bool, device=old_param.device)
-            else:
-                raise RuntimeError(
-                    f"Group '{name}' len={M}; total={total}, dyn={dyn_count}, "
-                    f"bg={bg_count}, surv={surv_count}"
-                )
+            submask = keep_mask
 
             state = self.optimizer.state.get(old_param, None)
             if state is not None:
@@ -554,27 +559,7 @@ class GaussianModel:
         self._dynamic_xyz = old_dyn[valid]
 
         # 3) Rebuild xyz
-        surv_dyn = old_dyn & valid
-        surv_bg  = (~old_dyn) & valid
-        pruned_dyn = old_xyz[surv_dyn]
-        pruned_bg  = old_xyz[surv_bg]
-
-        N_surv = valid.sum().item()
-        D      = old_xyz.size(1)
-        new_xyz = torch.empty((N_surv, D), device=old_xyz.device)
-
-        dyn_pos = old_dyn[valid]
-        bg_pos  = ~old_dyn[valid]
-
-        if "dynamic_xyz" in optim_tensors:
-            new_xyz[dyn_pos] = optim_tensors["dynamic_xyz"]
-        else:
-            new_xyz[dyn_pos] = pruned_dyn
-
-        if "background_xyz" in optim_tensors:
-            new_xyz[bg_pos] = optim_tensors["background_xyz"]
-        else:
-            new_xyz[bg_pos] = pruned_bg
+        new_xyz = optim_tensors["xyz"]
 
         # 4) Re‐wrap self._xyz (leaf + hook)
         self._xyz = nn.Parameter(new_xyz, requires_grad=True)
@@ -592,6 +577,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((n,1), device=self._xyz.device)
         self._deformation_accum = torch.zeros((n,3), device=self._xyz.device)
         self.denom              = torch.zeros((n,1), device=self._xyz.device)
+        self.depth_outlier_hits = torch.zeros((n,1), device=self._xyz.device)
         self.max_radii2D        = torch.zeros((n,),  device=self._xyz.device)
 
         # 7) If we had a hook, re‐install it now
@@ -708,6 +694,10 @@ class GaussianModel:
             self.denom,
             torch.zeros((M,1), device=dev)
         ], dim=0)
+        self.depth_outlier_hits= torch.cat([
+            self.depth_outlier_hits,
+            torch.zeros((M,1), device=dev)
+        ], dim=0)
         self.max_radii2D      = torch.cat([
             self.max_radii2D,
             torch.zeros((M,), device=dev)
@@ -721,13 +711,13 @@ class GaussianModel:
                 # broadcast: dynamic rows get dynamic LR, static get static LR
                 return grad * (m * self._lr_dynamic + (~m) * self._lr_static)
             self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._lr_hook_installed = True
+            self._xyz._has_dynamic_hook = True
 
 
 
 
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=10):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -739,7 +729,9 @@ class GaussianModel:
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
         if not selected_pts_mask.any():
             return
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        
+        #testing manual factor for more local splitting
+        stds = 0.01 * self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
@@ -762,7 +754,7 @@ class GaussianModel:
         grads: torch.Tensor,
         grad_threshold: float,
         scene_extent: float,
-        N: int = 10,
+        N: int = 3,
         median_dist: float = 0.1,
         factor: float = 0.1
     ):
@@ -1026,6 +1018,7 @@ class GaussianModel:
         downsampled_point_mask = torch.zeros((point_cloud.shape[0]), dtype=torch.bool).to(point_downsample.device)
         downsampled_point_mask[downsampled_point_index]=True
         return downsampled_point_mask
+    
     def grow(self, density_threshold=20, displacement_scale=20, model_path=None, iteration=None, stage=None):
         if not hasattr(self,"voxel_size"):
             self.voxel_size = 8  
@@ -1060,18 +1053,43 @@ class GaussianModel:
             os.makedirs(write_path,exist_ok=True)
             o3d.io.write_point_cloud(os.path.join(write_path,f"iteration_{stage}{iteration}.ply"),point)
         return
-    def prune(self, max_grad, min_opacity, extent, max_screen_size):
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
 
+    def compute_prune_mask(self,
+        min_opacity,
+        max_scale,
+        max_screen_size,
+        max_outlier_hits: int = None):
+        """
+        Compute exactly the same boolean mask that prune() would use,
+        but *don’t* actually remove the Gaussians yet.
+        Returns a torch.BoolTensor of shape [N].
+        """
+        # opacity & size gates
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(prune_mask, big_points_vs)
-
+            big_points_ws = self.get_scaling.max(dim=1).values > max_scale
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
 
+        # new outlier-hit gate
+        if max_outlier_hits is not None:
+            mask_bad = (self.depth_outlier_hits.squeeze() > max_outlier_hits)
+            prune_mask = torch.logical_or(prune_mask, mask_bad)
+        
+        return prune_mask
+
+    
+    def prune(self,
+        min_opacity,
+        max_scale,
+        max_screen_size,
+        max_outlier_hits: int = None):
+        
+        prune_mask = self.compute_prune_mask(min_opacity, max_scale, max_screen_size, max_outlier_hits)
+
+        self.prune_points(prune_mask)
         torch.cuda.empty_cache()
+
     def densify(self, max_grad, min_opacity, extent, median_dist=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -1109,6 +1127,101 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    @torch.no_grad()
+    def find_outlier_gaussians_and_update_hits(
+        self,
+        viewpoint_cams: list,
+        depth_pred_batch: torch.Tensor,
+        depth_gt_batch:   torch.Tensor,
+        error_thresh_cm:  float    = 0.05,
+        topk_percent:     float    = None,
+        search_radius:    float    = None,
+    ):
+        """
+        1) For each of B views, find pixels where |Dpred - Dgt| > error_thresh_cm
+        (optionally keep only the top-k% largest errors).
+        2) Ray-march each bad pixel to 3D:  P = C + d_pred * ray_dir.
+        3) KD-tree nearest-neighbour search from these P → Gaussian indices.
+        4) Increment self.depth_outlier_[batch_]hits for each culprit.
+        """
+        B, H, W = depth_pred_batch.shape
+        device = depth_pred_batch.device
+
+        # 1) collect all “bad” hit-points in world-coords
+        all_queries = []
+        for b, cam in enumerate(viewpoint_cams):
+            # per-pixel abs error
+            E = (depth_pred_batch[b] - depth_gt_batch[b]).abs()
+            # base mask
+            mask = E > error_thresh_cm
+            # top-k% by magnitude?
+            if topk_percent is not None and 0 < topk_percent < 1.0:
+                K = int(topk_percent * mask.numel())
+                if K > 1:
+                    flat = E.view(-1)
+                    topk_mask = (torch.topk(flat, K, largest=True).values > error_thresh_cm)
+                    topk_idx = torch.topk(flat, K, largest=True).indices[topk_mask]
+                    mask_flat = torch.zeros_like(flat, dtype=torch.bool)
+                    mask_flat[topk_idx] = True
+                    mask = mask_flat.view(H, W)
+                
+            coords = mask.nonzero(as_tuple=False)           # [M,2] rows=v, cols=u
+            if coords.numel() == 0:
+                continue
+
+            vs = coords[:,0].float()
+            us = coords[:,1].float()
+            ds = depth_pred_batch[b, coords[:,0], coords[:,1]]  # [M]
+
+            # 2) camera→world ray computation
+            # normals in NDC space:
+            tanx = np.tan(cam.FoVx * 0.5)
+            tany = np.tan(cam.FoVy * 0.5)
+            x_ndc = (us / (W - 1) * 2 - 1) * tanx
+            y_ndc = -(vs / (H - 1) * 2 - 1) * tany
+
+            # rays in camera frame (camera looks along -Z)
+            rays_cam = torch.stack([x_ndc, y_ndc, -torch.ones_like(x_ndc)], dim=1).to(device)  # [M,3]
+
+            # convert to world frame via inverse of world->cam rotation
+            V = cam.world_view_transform.to(device)           # [4×4]
+            R = V[:3, :3]                                     # world->cam rotation
+            R_inv = R.transpose(0,1)                          # cam->world rotation
+            rays_world = rays_cam @ R_inv                     # [M,3]
+            rays_world = rays_world / rays_world.norm(dim=1, keepdim=True)
+
+            Cw = cam.camera_center.to(device).view(1,3)       # [1,3]
+            pts_world = Cw + rays_world * ds.view(-1,1)       # [M,3]
+
+            all_queries.append(pts_world.detach().cpu().numpy())
+
+        if len(all_queries) == 0:
+            return
+
+        Q = np.concatenate(all_queries, axis=0)               # [M_tot,3]
+
+        # 3) build KD-tree if needed
+        # detach to CPU numpy
+        pts = self._xyz.detach().cpu().numpy()    # [N,3]
+        self._kd_tree = KDTree(pts, leaf_size=40)
+
+        # 4) nearest neighbour
+        dist, idx = self._kd_tree.query(Q, k=2)              # [M_tot,1]
+        idx = idx.ravel()                                     # [M_tot]
+
+        # 5) apply optional radius filter
+        if search_radius is not None:
+            mask_ok = dist.ravel() <= search_radius
+            idx = idx[mask_ok]
+
+        # 6) tally into our counters
+        uniq, inv = np.unique(idx, return_inverse=True)
+        counts   = np.bincount(inv)
+        for g_id, c in zip(uniq, counts):
+            # counters
+            self.depth_outlier_hits[g_id, 0] += int(c)
+
 
     @torch.no_grad()
     def update_deformation_table(self,threshold):

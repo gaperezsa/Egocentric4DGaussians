@@ -57,6 +57,6 @@ if __name__ == "__main__":
     
 
     # aria
-    folder_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/pc_aligned_video1/background_depth_train_render/images"
-    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/pc_aligned_video1/background_depth_train_render/aligned_optimizer_background_depth_train.mp4"
+    folder_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/BASELINE_officialHOI4DVideo2_BD5000_BRGB14000_DD14000_DRGB14000_fine10000_startStaticLR0.000_startDynamicLR0.000_pruneInterval670_densifyInterval755_best/fine_coloring_train_render/images"
+    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/BASELINE_officialHOI4DVideo2_BD5000_BRGB14000_DD14000_DRGB14000_fine10000_startStaticLR0.000_startDynamicLR0.000_pruneInterval670_densifyInterval755_best/fine_coloring_train_render/video_2_fine_coloring_train.mp4"
     create_video_from_png(folder_path, output_video_path)
