@@ -43,7 +43,7 @@ def l1_background_colored_masked_loss(network_output, gt, mask, background_color
     '''
     # Converting to tensor of broadcastable dimension and replacing outside the mask with background color
     backgrounded_image = torch.where(mask, gt, background_color.view(1,3,1,1))
-    return torch.abs((network_output - backgrounded_image)).mean()
+    return torch.abs((network_output - backgrounded_image)).sum()
 
 def l1_filtered_depth_valid_loss(network_output, gt, filter):
     valid_depth = gt > 0.001

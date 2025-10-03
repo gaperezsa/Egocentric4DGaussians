@@ -36,3 +36,39 @@ def psnr(img1, img2, mask=None):
             psnr = psnr[~torch.isinf(psnr)]
         
     return psnr
+
+@torch.no_grad()
+def psnr_map(img1: torch.Tensor,
+             img2: torch.Tensor,
+             mask: torch.Tensor = None,
+             max_val: float = 1.0,
+             eps: float = 1e-8,
+             clamp_range: tuple=(20,40)):
+    """
+    Per-pixel PSNR map.
+
+    Args:
+        img1, img2: [B,3,H,W], range [0,1].
+        mask: optional [B,1,H,W] or [B,H,W] boolean; False pixels will be NaN in the map.
+        max_val: intensity max (1.0 for normalized tensors).
+        eps: floor to avoid log(0).
+        clamp_range: optional (vmin, vmax) to clamp PSNR map.
+
+    Returns:
+        psnr_map: [B,1,H,W] float32. Higher = better. NaN where mask=False.
+    """
+    # MSE per pixel across channels
+    mse_map = (img1 - img2).pow(2).mean(dim=1, keepdim=True)  # [B,1,H,W]
+    # PSNR per pixel
+    psnr_map = 10.0 * torch.log10((max_val * max_val) / torch.clamp(mse_map, min=eps))
+
+    if mask is not None:
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        psnr_map = psnr_map.masked_fill(~mask.bool(), float('nan'))
+
+    if clamp_range is not None:
+        vmin, vmax = clamp_range
+        psnr_map = torch.clamp(psnr_map, vmin, vmax)
+
+    return psnr_map

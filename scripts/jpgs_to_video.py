@@ -22,7 +22,7 @@ def create_video_from_png(folder_path, output_video_path):
 
     # Create video writer object
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_video_path, fourcc, 15, (frame_width, frame_height))  # 30 fps
+    video_writer = cv2.VideoWriter(output_video_path, fourcc, 30, (frame_width, frame_height))  # 18 fps
 
     try:
         # Iterate over the sorted list of file paths
@@ -56,7 +56,6 @@ def numerical_sort_key(s):
 if __name__ == "__main__":
     
 
-    # aria
-    folder_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/BASELINE_officialHOI4DVideo2_BD5000_BRGB14000_DD14000_DRGB14000_fine10000_startStaticLR0.000_startDynamicLR0.000_pruneInterval670_densifyInterval755_best/fine_coloring_train_render/images"
-    output_video_path = "/home/gperezsantamaria/data/Egocentric4DGaussians/output/BASELINE_officialHOI4DVideo2_BD5000_BRGB14000_DD14000_DRGB14000_fine10000_startStaticLR0.000_startDynamicLR0.000_pruneInterval670_densifyInterval755_best/fine_coloring_train_render/video_2_fine_coloring_train.mp4"
+    folder_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/evaluation/eval"
+    output_video_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/evaluation/full_eval_video_2_rendered.mp4"
     create_video_from_png(folder_path, output_video_path)

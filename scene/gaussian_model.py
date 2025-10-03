@@ -17,7 +17,7 @@ import os
 import open3d as o3d
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from random import randint
+from random import randint, sample
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
@@ -212,12 +212,9 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook if not already existing
-            # Remember if we already had the dynamic hook
-            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
-            if not has_hook:
-                self._xyz.register_hook(_dynamic_grad_hook)
-                self._xyz._has_dynamic_hook = True
+            # Register hook even if already existing
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
@@ -254,12 +251,9 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook if not already existing
-            # Remember if we already had the dynamic hook
-            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
-            if not has_hook:
-                self._xyz.register_hook(_dynamic_grad_hook)
-                self._xyz._has_dynamic_hook = True
+            # Register hook even if already existing
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz],'lr': 1.0,"name": "xyz"},
@@ -271,7 +265,7 @@ class GaussianModel:
                 {'params': [self._scaling],       'lr': 0, "name": "scaling"},
                 {'params': [self._rotation],      'lr': 0, "name": "rotation"},
             ]
-            max_steps = max(training_args.position_lr_max_steps, training_args.dynamics_depth_iterations)
+            max_steps = min(training_args.position_lr_max_steps, training_args.dynamics_depth_iterations)
             self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
                                                     lr_final=0,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -296,24 +290,21 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook if not already existing
-            # Remember if we already had the dynamic hook
-            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
-            if not has_hook:
-                self._xyz.register_hook(_dynamic_grad_hook)
-                self._xyz._has_dynamic_hook = True
+            # Register hook even if already existing
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
 
             l = [
-                {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
-                {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
-                {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale, "name": "grid"},
+                {'params': [self._xyz], 'lr': 0.0, "name": "xyz"},
+                {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale * 0.1, "name": "deformation"},
+                {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale * 0.1, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
                 {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
-            max_steps = max(training_args.position_lr_max_steps, training_args.dynamics_RGB_iterations)
+            max_steps = min(training_args.position_lr_max_steps, training_args.dynamics_RGB_iterations)
             self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
                                                     lr_final=0,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -339,29 +330,27 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook if not already existing
-            # Remember if we already had the dynamic hook
-            has_hook = getattr(self._xyz, "_has_dynamic_hook", False)
-            if not has_hook:
-                self._xyz.register_hook(_dynamic_grad_hook)
-                self._xyz._has_dynamic_hook = True
+            # Register hook even if already existing
+            self._xyz.register_hook(_dynamic_grad_hook)
+            self._xyz._has_dynamic_hook = True
+
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
-                {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler, "name": "deformation"},
-                {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler, "name": "grid"},
+                {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler *0.1, "name": "deformation"},
+                {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler *0.1, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
                 {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
-            max_steps = max(training_args.position_lr_max_steps, training_args.fine_iterations)
+            max_steps = min(training_args.position_lr_max_steps, training_args.fine_iterations)
             self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.static_position_lr_init * self.spatial_lr_scale,
                                                     lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
-            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.dynamic_position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.dynamic_position_lr_final*self.spatial_lr_scale,
+            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.dynamic_position_lr_init*self.spatial_lr_scale*0.01, # manual dyn lr deduction
+                                                    lr_final=training_args.dynamic_position_lr_final*self.spatial_lr_scale*0.01,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
             self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler,
@@ -717,7 +706,7 @@ class GaussianModel:
 
 
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, percentage_of_train_stage_remaining = 1):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -730,8 +719,8 @@ class GaussianModel:
         if not selected_pts_mask.any():
             return
         
-        #testing manual factor for more local splitting
-        stds = 0.01 * self.get_scaling[selected_pts_mask].repeat(N,1)
+        #factor for more local splitting
+        stds = (0.1 * percentage_of_train_stage_remaining) * self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
@@ -754,109 +743,99 @@ class GaussianModel:
         grads: torch.Tensor,
         grad_threshold: float,
         scene_extent: float,
-        N: int = 3,
+        N: int = 2,
         median_dist: float = 0.1,
-        factor: float = 0.1
+        percentage_of_train_stage_remaining: float = 1.0
     ):
         """
-        Very‐local, Chamfer‐adaptive splitting of dynamic Gaussians.
+        Dynamic Gaussian splitting aligned to parent ellipsoid axes (static-like),
+        with Chamfer-based culling.
+
+        Differences vs original dynamic version:
+        - Sample offsets in the parent's local frame with per-axis std = factor * parent_scale.
+        - Rotate offsets to world space via quaternion (build_rotation).
+        - Shrink child scales like the static function (/(0.8*N)) and prune parents.
+        - Cull children whose world-space offset norm > median_dist.
 
         Args:
-            grads (Tensor): 1D tensor of shape (M,) holding per-Gaussian gradient magnitudes.
-            grad_threshold (float): threshold above which to consider splitting.
-            scene_extent (float): used for any additional size checks (unused here).
-            N (int): how many children to spawn per selected parent.
-            median_dist (float): median chamfer distance between all dynamic Gaussians and GT points.
-            factor (float): fraction of median_dist to use as sampling std.
-
-        For each parent Gaussian i where:
-            - grads[i] ≥ grad_threshold, and
-            - parent is marked dynamic, and
-            - parent’s scale > percent_dense * scene_extent
-        we:
-            1) set std = factor * median_dist,
-            2) sample N offsets ∼ N(0, std) in world coords,
-            3) position children = parent_center + offset,
-            4) prune any child whose ‖offset‖ > median_dist,
-            5) copy parent’s features, opacity, scale, rotation, deformation_flag to each surviving child,
-            and mark them dynamic.
+            grads: 1D tensor (M,) with per-Gaussian gradient magnitudes.
+            grad_threshold: threshold to consider splitting.
+            scene_extent: used to gate by size like in the static function.
+            N: children per selected parent.
+            median_dist: culling radius for spawned children (world-space).
+            percentage_of_train_stage_remaining: multiplies parent per-axis scales to set local sampling std. smaller as treining goes on
         """
         device = self._xyz.device
         n_pts = self.get_xyz.shape[0]
 
-        # 1) Build a full‐length “padded” gradient vector
+        # 1) Pad grads to full length
         padded = torch.zeros((n_pts,), device=device)
-        # grads might be length M ≤ n_pts; copy into front
         padded[:grads.shape[0]] = grads.squeeze()
 
-        # 2) Select parents: (grad ≥ thr) AND dynamic AND large enough to split
+        # 2) Select parents: high grad, dynamic, large enough
         sel = (padded >= grad_threshold) & self._dynamic_xyz
         sel = sel & (torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
         if not sel.any():
             return
 
-        # 3) Gather parent data (K = number of selected parents)
-        parent_xyz     = self._xyz[sel]            # [K, 3]
-        parent_scales  = self.get_scaling[sel]     # [K, 3]
-        parent_radius  = torch.max(parent_scales, dim=1).values  # [K]
-
+        # 3) Gather parent data
+        parent_xyz    = self.get_xyz[sel]          # [K, 3] (data-space centers)
+        parent_scale  = self.get_scaling[sel]      # [K, 3] (data-space scales)
+        parent_quat   = self._rotation[sel]        # [K, 4] (w,x,y,z)
         K = parent_xyz.shape[0]
-        # If median_dist is zero (unlikely), skip
+
+        # 4) Local-frame sampling stds (anisotropic): factor * parent_scale
+        #    Repeat for N children per parent
+        stds_local = ((0.1 * percentage_of_train_stage_remaining)  * parent_scale).repeat_interleave(N, dim=0)  # [K*N, 3]
+        means_local = torch.zeros_like(stds_local, device=device)
+
+        # 5) Sample local offsets and rotate into world frame
+        #    Build rotation matrices for parents, repeat N times (ordering matched by repeat_interleave)
+        rots = build_rotation(parent_quat).repeat_interleave(N, dim=0)    # [K*N, 3, 3]
+
+        #    Sample local offsets ~ N(0, diag(stds_local^2))
+        local_offsets = torch.normal(mean=means_local, std=stds_local)     # [K*N, 3]
+
+        #    Rotate to world, add parent centers
+        centers = parent_xyz.repeat_interleave(N, dim=0)                   # [K*N, 3]
+        world_offsets = torch.bmm(rots, local_offsets.unsqueeze(-1)).squeeze(-1)  # [K*N, 3]
+        candidate_xyz = centers + world_offsets                             # [K*N, 3]
+
+        # 6) Chamfer-based culling: drop children too far from parent (> median_dist)
         if median_dist <= 1e-9:
             return
-
-        # 4) Compute global σ and maximum allowed
-        offset_std = median_dist * factor            # a small fraction of median Chamfer distance
-        max_allowed = 2 * median_dist            # children further than this get pruned
-
-        # 5) Sample N children per parent: isotropic world-space
-        #    Total to sample = K * N
-        total_new = K * N
-        # Create a (total_new × 3) tensor of isotropic offsets
-        offsets = torch.normal(
-            mean=torch.zeros((total_new, 3), device=device),
-            std=torch.ones((total_new, 3), device=device) * offset_std
-        )
-        # Repeat each parent center N times → [K*N, 3]
-        centers = parent_xyz.repeat(N, 1)
-
-        candidate_xyz = centers + offsets  # [K*N, 3]
-
-        # 6) Compute each child’s distance from its parent
-        parent_repeated = parent_xyz.repeat(N, 1)  # [K*N, 3]
-        dists = torch.norm(candidate_xyz - parent_repeated, dim=1)  # [K*N]
-
-        # 7) Keep only those within max_allowed
-        keep = (dists <= max_allowed)
+        dists = torch.norm(world_offsets, dim=1)                            # [K*N]
+        keep = (dists <= median_dist)
         if not keep.any():
             return
 
-        new_xyz     = candidate_xyz[keep]                     # [M, 3]
-        new_dynamic = torch.ones(keep.sum(), dtype=torch.bool, device=device)
+        new_xyz      = candidate_xyz[keep]                                  # [M, 3]
+        new_dynamic  = torch.ones(keep.sum(), dtype=torch.bool, device=device)
 
-        # 8) Copy parent attributes, repeated N times, then indexed by keep
-        #    First gather parent tensors (each length K)
-        fe_dc_parent    = self._features_dc[sel]        # [K, F_dc, 1]
-        fe_r_parent     = self._features_rest[sel]      # [K, F_rest, 1]
+        # 7) Prepare child attributes (copy from parents, shrink scales like static)
+        #    Gather parent tensors (length K), then repeat_interleave to [K*N, ...], then mask by keep.
+        fe_dc_parent    = self._features_dc[sel]        # [K, Fdc, 1]
+        fe_r_parent     = self._features_rest[sel]      # [K, Fres, 1]
         op_parent       = self._opacity[sel]            # [K, 1]
-        sc_parent       = self._scaling[sel]            # [K, 3]
         rot_parent      = self._rotation[sel]           # [K, 4]
         def_tbl_parent  = self._deformation_table[sel]  # [K]
 
-        # Helper to repeat each parent entry N times, then mask by keep
-        def repeat_and_keep(x: torch.Tensor):
-            # x.shape = [K, ...]. We want [K*N, ...], repeated along batch dim
-            rep = x.repeat_interleave(N, dim=0)  # [K*N, ...]
+        def rep_keep(x: torch.Tensor):
+            rep = x.repeat_interleave(N, dim=0)
             return rep[keep]
 
-        new_features_dc   = repeat_and_keep(fe_dc_parent)   # [M, F_dc, 1]
-        new_features_rest = repeat_and_keep(fe_r_parent)    # [M, F_rest, 1]
-        new_opacity       = repeat_and_keep(op_parent)      # [M, 1]
-        new_scaling       = repeat_and_keep(sc_parent)      # [M, 3]
-        new_rotation      = repeat_and_keep(rot_parent)     # [M, 4]
-        new_deform_tbl    = repeat_and_keep(def_tbl_parent) # [M]
+        new_features_dc   = rep_keep(fe_dc_parent)      # [M, Fdc, 1]
+        new_features_rest = rep_keep(fe_r_parent)       # [M, Fres, 1]
+        new_opacity       = rep_keep(op_parent)         # [M, 1]
+        new_rotation      = rep_keep(rot_parent)        # [M, 4]
+        new_deform_tbl    = rep_keep(def_tbl_parent)    # [M]
 
-        # 9) Finally, add them into the Gaussian model
+        # Child scaling: same rule as static: shrink in *data space* then map back to param space
+        parent_scale_rep = self.get_scaling[sel].repeat_interleave(N, dim=0)  # [K*N, 3] data-space
+        child_scale_data = (parent_scale_rep / (0.8 * N))[keep]               # [M, 3]
+        new_scaling      = self.scaling_inverse_activation(child_scale_data)  # param-space
+
+        # 8) Append children
         self.densification_postfix(
             new_xyz,
             new_dynamic,
@@ -867,6 +846,15 @@ class GaussianModel:
             new_rotation,
             new_deform_tbl
         )
+
+        # 9) Prune the parents we split (keep all the children we just added)
+        #    After densification_postfix, total length is n_pts + M.
+        prune_filter = torch.cat(
+            (sel, torch.zeros(new_xyz.shape[0], dtype=torch.bool, device=device)),
+            dim=0
+        )
+        self.prune_points(prune_filter)
+
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         grads_accum_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -916,12 +904,28 @@ class GaussianModel:
         #     o3d.io.write_point_cloud(os.path.join(write_path,f"iteration_{stage}{iteration}.ply"),point)
         #     print("write output.")
 
-    def spawn_dynamic_gaussians(self, selected_pts_mask=None):
+    def spawn_dynamic_gaussians(self, random_init=True, precomputed_positions=None):
+        """
+        Very‐local, Chamfer‐adaptive splitting of dynamic Gaussians.
+
+        Args:
+            random_init (Bool): initiate dynamic gaussians randomly?.
+            precomputed_positions (tensor of shape Mx3): list of xyz coordinates to initiate dynamic gaussians.
+        """
+
         # 1) Select a random subset if not provided
-        if selected_pts_mask is None:
+        if random_init:
             selected_pts_mask = torch.rand(self._xyz.shape[0], device=self._xyz.device) < 0.01
         else:
-            assert len(selected_pts_mask) == self._xyz.shape[0]
+            if precomputed_positions is not None:
+                sampled_ids = sample(range(self._xyz.shape[0]),precomputed_positions.shape[0])
+                selected_pts_mask = torch.zeros(self._xyz.shape[0])
+                selected_pts_mask[sampled_ids] = 1
+                selected_pts_mask = selected_pts_mask > 0
+            else:
+                print("\nrandom init is has been manually set to false but precomputed positions were not provided either")
+                print("\ndefault random is going to be assumed, manual deactivation of random is ignored")
+                selected_pts_mask = torch.rand(self._xyz.shape[0], device=self._xyz.device) < 0.01
 
         n_new = selected_pts_mask.sum().item()
         if n_new == 0:
@@ -933,7 +937,10 @@ class GaussianModel:
         #    - maximum opacity
         max_opacity = self._opacity.max().item()                  # scalar
         # 3) Gather the positions & rotations & features for the selected centers
-        new_xyz            = self._xyz[selected_pts_mask]
+        if precomputed_positions is None:
+            new_xyz            = self._xyz[selected_pts_mask]
+        else:
+            new_xyz            = precomputed_positions.to(self._xyz.device)
         new_dynamic_xyz    = torch.ones(n_new, dtype=torch.bool, device=self._xyz.device)
         new_features_dc    = self._features_dc[selected_pts_mask]
         new_features_rest  = self._features_rest[selected_pts_mask]
@@ -1090,25 +1097,25 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def densify(self, max_grad, min_opacity, extent, median_dist=None):
+    def densify(self, max_grad, min_opacity, extent, median_dist=None, percentage_of_train_stage_remaining=1.0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
         
         if median_dist != None:
-            self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist)
+            self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining)
         else:
-            self.densify_and_split(grads, max_grad, extent)
+            self.densify_and_split(grads, max_grad, extent, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining)
 
 
-    def densify_dynamic(self, max_grad, min_opacity, extent, median_dist):
+    def densify_dynamic(self, max_grad, min_opacity, extent, median_dist=None, percentage_of_train_stage_remaining=1.0):
         # 1) call self.densify_and_clone but with a small fixed std for dynamic points
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
         # 2) call self.densify_and_split but override the std to e.g. displacement_scale_small
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist)
+        self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining)
 
     def standard_constaint(self):
         

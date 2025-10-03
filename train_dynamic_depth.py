@@ -36,6 +36,7 @@ from utils.loader_utils import FineSampler, get_stamp_list
 import lpips
 from utils.scene_utils import render_training_image, debug_render_training_image_by_mask
 from utils.render_utils import prune_by_visibility, prune_by_average_radius, look_at
+from utils.metric_visualization_utils import generate_psnr_heatmaps_for_folder
 from time import time
 import copy
 import json
@@ -288,9 +289,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             depth_loss = hyper.general_depth_weight * depth_loss
 
         elif stage == "fine_coloring":
-            depth_loss = l1_loss(depth_image_tensor, gt_depth_image_tensor)
+            depth_loss = 0.5 * hyper.general_depth_weight * l1_loss(depth_image_tensor, gt_depth_image_tensor)
 
-
+        
         loss = Ll1 + depth_loss + dynamic_mask_loss
 
         psnr_ = 0
@@ -353,9 +354,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 scene.save(iteration, stage)
             if dataset.render_process:
                 if (iteration < 1000 and iteration % 50 == 1) \
-                    or (iteration < 3000 and iteration % 50 == 1) \
-                        or (iteration < 60000 and iteration %  50 == 1) \
-                            or (iteration < 200000 and iteration %  50 == 1) :
+                    or (iteration < 3000 and iteration % 100 == 1) \
+                        or (iteration < 60000 and iteration %  100 == 1) \
+                            or (iteration < 200000 and iteration %  100 == 1) :
                             # breakpoint()
                             render_training_image(scene, gaussians, [test_cams[0%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
                             #render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
@@ -398,8 +399,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     densify_threshold = opt.densify_grad_threshold_after
                 
                 # Densify if in the middle of training
-                if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter and iteration < int(0.8 * final_iter) and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000:
-                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist)
+                if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter and iteration < int(0.8 * final_iter) and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<400000:
+                    percentage_of_train_stage_remaining = 1-(iteration/final_iter)
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist, percentage_of_train_stage_remaining )
                 
                 # prune
                 if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
@@ -499,7 +501,7 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                 break
     
     
-
+    
     if  current_stage == stages[0]: 
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
@@ -513,10 +515,11 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                                 gaussians, scene, "background_RGB", tb_writer, using_wandb, training_iters[1], timer, first_iters[1])
         render_set_no_compression(dataset.model_path, "background_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
         current_stage = stages[2]
-        
+
+    
     if  current_stage == stages[2]:
         # Initialize dynamic gaussians in the model
-        gaussians.spawn_dynamic_gaussians()
+        gaussians.spawn_dynamic_gaussians(random_init = False, precomputed_positions = list(scene.getTrainCameras())[10].backproject_mask_to_world())
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "dynamics_depth", tb_writer, using_wandb, training_iters[2], timer, first_iters[2])
@@ -541,7 +544,7 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
     
 
     # —— visibility-based pruning just before final render ——
-    
+    '''
     
     print("Computing per-Gaussian visibility over all training frames…")
     prune_by_visibility(
@@ -553,7 +556,7 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
         cam_type,
         threshold=0.2  # drop those seen in <20% of frames
     )
-    '''
+    
     print("Pruning by average screen‐radius…")
     prune_by_average_radius(
         gaussians,
@@ -569,6 +572,7 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
 
     render_set_no_compression(dataset.model_path, "final_train_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=True, render_func = render_with_dynamic_gaussians_mask)
     
+    '''
     # Show optinal exocentric camera render
     # —— static first‐frame view, offset “behind” by 10% —— 
     if scene.dataset_type == "colmap":
@@ -623,11 +627,28 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
             aria=True,
             render_func=render_with_dynamic_gaussians_mask
         )
+    '''
 
+    # Visualize PSNR
 
+    final_folder = os.path.join(dataset.model_path, "final_train_render", f"ours_{total_iters}")
 
+    generate_psnr_heatmaps_for_folder(
+        final_folder,
+        out_subdir="psnr_heatmaps",
+        vmin=20.0,
+        vmax=35.0,
+        error_colors=True,
+        make_video=True,
+        fps=15,
+        rotate_ccw_90=True,        # << rotate 90° CCW
+        save_legend=True,          # writes psnr_colorbar_legend.png once
+        add_colorbar_per_frame=False  # set True if you want the legend on every frame
+    )
 
     evaluate_single_folder(os.path.join(dataset.model_path, "final_train_render", "ours_{}".format(total_iters)))
+
+    
     
 def prepare_output_and_logger(expname):    
     if not args.model_path:
