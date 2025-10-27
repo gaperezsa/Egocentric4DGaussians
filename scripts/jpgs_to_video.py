@@ -11,7 +11,7 @@ def create_video_from_png(folder_path, output_video_path):
     # Print folder name being processed
     print(f"Processing folder: {folder_path}")
     # Search for .png files in the folder
-    png_files = glob.glob(os.path.join(folder_path, '*.jpg'))
+    png_files = glob.glob(os.path.join(folder_path, '*.png'))
     # Sort the list of file paths
     sorted_files = sorted(png_files)
 
@@ -22,7 +22,7 @@ def create_video_from_png(folder_path, output_video_path):
 
     # Create video writer object
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_video_path, fourcc, 30, (frame_width, frame_height))  # 18 fps
+    video_writer = cv2.VideoWriter(output_video_path, fourcc, 15, (frame_width, frame_height))  # 18 fps
 
     try:
         # Iterate over the sorted list of file paths
@@ -56,6 +56,6 @@ def numerical_sort_key(s):
 if __name__ == "__main__":
     
 
-    folder_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/evaluation/eval"
-    output_video_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/evaluation/full_eval_video_2_rendered.mp4"
+    folder_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/entire_sequence_rendered_depth"
+    output_video_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/entire_sequence_rendered_depth/EgoGaussian_video_2_colored_rendered_depth.mp4"
     create_video_from_png(folder_path, output_video_path)

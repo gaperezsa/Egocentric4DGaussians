@@ -12,11 +12,13 @@ import imageio
 import numpy as np
 import torch
 from scene import Scene
-import os
+import os, re, json, imageio
 import cv2
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render, render_with_dynamic_gaussians_mask
+from gaussian_renderer import render, render_with_dynamic_gaussians_mask as default_render
+from utils.split_utils import load_splits_if_available, select_by_indices
+from utils.depth_gt_utils import ensure_true_depth_gt
 import torchvision
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
@@ -24,6 +26,9 @@ from arguments import ModelParams, PipelineParams, get_combined_args, ModelHidde
 from gaussian_renderer import GaussianModel
 from time import time
 from pathlib import Path
+from typing import List
+import matplotlib as mpl
+
 # import torch.multiprocessing as mp
 import threading
 import concurrent.futures
@@ -118,164 +123,318 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     Path(os.path.join(model_path, name, "ours_{}".format(iteration))).mkdir(parents=True, exist_ok=True)
     imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
 
-def render_set_no_compression(model_path, name, iteration, views, gaussians, pipeline, background, cam_type, aria=False, override_color = None, override_opacity = None, render_func = render):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    depth_gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth_gt")
-    depth_render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth_renders")
-    depth_render_tensors_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth_renders_tensors")
-    depth_gts_tensors_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth_gt_tensors")
+def _write_png_named(tensor_list, name_list, out_dir):
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    for t, name in zip(tensor_list, name_list):
+        p = os.path.join(out_dir, f"{name}.png")
+        torchvision.utils.save_image(t.to(torch.float32), p)
 
-    makedirs(render_path, exist_ok=True)
-    makedirs(depth_render_path, exist_ok=True)
-    makedirs(depth_render_tensors_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-    makedirs(depth_gts_path, exist_ok=True)
-    makedirs(depth_gts_tensors_path, exist_ok=True)
+def _save_tensors_named(tensor_list, name_list, out_dir):
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    for t, name in zip(tensor_list, name_list):
+        p = os.path.join(out_dir, f"{name}.pt")
+        torch.save(t, p)
 
-    render_list = []
-    gt_list = []
+def _save_fixed_jet_np(depth_m_np: np.ndarray, out_png: str, vmin: float = 0.0, vmax: float = 2.5):
+    """
+    Save a jet heatmap with a FIXED metric range [vmin, vmax] meters:
+      vmin (<=) -> blue, vmax (>=) -> red. Non-positive depth => black.
+    """
+    cmap = mpl.cm.get_cmap('jet')
+    d = depth_m_np.copy()
+    nonpos = d <= 0.0
+    d = np.clip(d, vmin, vmax)
+    denom = max(vmax - vmin, 1e-6)
+    norm = (d - vmin) / denom
+    vis = (cmap(norm)[..., :3] * 255.0).astype(np.uint8)
+    vis[nonpos] = 0
+    imageio.imwrite(out_png, vis)
 
-    depth_render_list = []
-    depth_render_tensor_list = []
-    
-    gt_depth_list = []
-    gt_depth_tensor_list = []
+def _write_fixed_jet_from_tensors(run_dir: str, names: list, vmin: float = 0.0, vmax: float = 2.5):
+    """
+    Given a render run folder with:
+      depth_renders_tensors/<name>.pt
+      depth_gt_tensors/<name>.pt   (optional; created by ensure_true_depth_gt)
+    create fixed-range jet PNGs in:
+      depth_metric_vis_fixed/<name>.png      (pred)
+      aligned_metric_vis_fixed/<name>.png    (compat alias to EgoGaussian)
+      depth_gt_vis_fixed/<name>.png          (gt)
+    """
+    run = Path(run_dir)
+    pred_pt_dir = run / "depth_renders_tensors"
+    gt_pt_dir   = run / "depth_gt_tensors"
+
+    pred_vis_dir = run / "depth_metric_vis_fixed"
+    pred_vis_dir.mkdir(parents=True, exist_ok=True)
+    # alias folder to look like EgoGaussian, if downstream expects it
+    alias_vis_dir = run / "aligned_metric_vis_fixed"
+    alias_vis_dir.mkdir(parents=True, exist_ok=True)
+
+    gt_vis_dir = run / "depth_gt_vis_fixed"
+    gt_vis_dir.mkdir(parents=True, exist_ok=True)
+
+    for n in names:
+        # predicted
+        pt_p = pred_pt_dir / f"{n}.pt"
+        if pt_p.is_file():
+            d = torch.load(pt_p)
+            while d.dim() > 2:
+                d = d.squeeze(0)
+            dnp = d.detach().cpu().numpy().astype(np.float32)
+            _save_fixed_jet_np(dnp, str(pred_vis_dir / f"{n}.png"), vmin, vmax)
+            _save_fixed_jet_np(dnp, str(alias_vis_dir / f"{n}.png"), vmin, vmax)
+
+        # GT (true sparse)
+        gtp = gt_pt_dir / f"{n}.pt"
+        if gtp.is_file():
+            g = torch.load(gtp)
+            while g.dim() > 2:
+                g = g.squeeze(0)
+            gnp = g.detach().cpu().numpy().astype(np.float32)
+            _save_fixed_jet_np(gnp, str(gt_vis_dir / f"{n}.png"), vmin, vmax)
+
+@torch.no_grad()
+def render_set_no_compression(
+    model_path, name, iteration, views, gaussians, pipeline, background,
+    cam_type, aria=False, override_color=None, override_opacity=None,
+    render_func=default_render, subdir=None, use_original_filenames=True,
+    make_videos=True, source_path=None, write_true_depth_gt=False
+):
+    """
+    Renders a set of views to:
+      <model_path>/<name>/<subdir or '.'>/ours_<iteration>/
+        renders/                (RGB renders)          *.png
+        gt/                     (RGB GT)               *.png
+        depth_renders_tensors/  (pred depth tensors)   *.pt
+        depth_renders/          (depth viz PNGs)       *.png
+        # NO dense GT depth here
+        # true sparse GT depth is optionally materialized from raw source:
+        depth_gt_tensors/       (true GT, meters)      *.pt
+        depth_gt/               (true GT viz)          *.png
+
+    Filenames match view.image_name when use_original_filenames=True.
+    If write_true_depth_gt=True and source_path is set, we populate true GT depth.
+    """
+    base_dir = os.path.join(model_path, name)
+    if subdir is not None:
+        base_dir = os.path.join(base_dir, subdir)
+    run_dir = os.path.join(base_dir, f"ours_{iteration}")
+
+    render_path = os.path.join(run_dir, "renders")
+    gts_path = os.path.join(run_dir, "gt")
+    depth_render_path = os.path.join(run_dir, "depth_renders")
+    depth_render_tensors_path = os.path.join(run_dir, "depth_renders_tensors")
+
+    for d in [render_path, gts_path, depth_render_path, depth_render_tensors_path]:
+        Path(d).mkdir(parents=True, exist_ok=True)
 
     print("point nums:", gaussians._xyz.shape[0])
 
+    def _filename_stem(view, fallback_idx: int) -> str:
+        """
+        Prefer trailing digits from view.image_name (drop leading zeros),
+        else use the basename stem, else a zero-padded fallback index.
+        """
+        if use_original_filenames:
+            raw = getattr(view, "image_name", None)
+            if raw:
+                base = os.path.splitext(os.path.basename(str(raw)))[0]
+                m = re.search(r"(\d+)$", base)
+                if m:
+                    return str(int(m.group(1)))  # '00008' -> '8'
+                return base                     # e.g. 'IMG_1234' → 'IMG_1234'
+        return f"{fallback_idx:05d}"            # very last fallback
+
+    # collections
+    rgb_render_list, rgb_gt_list, names = [], [], []
+    depth_render_vis_list, depth_render_tensor_list = [], []
+    W = H = None
+    first, t0 = True, 0.0
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        with torch.no_grad():
-            if idx == 0:
-                time1 = time()
+        if first:
+            first, t0 = False, time()
 
-            # Render the current view, with no gradients required
-            render_pkg = render_func(view, gaussians, pipeline, background, cam_type=cam_type, override_color = override_color, override_opacity = override_opacity)
+        pkg = render_func(
+            view, gaussians, pipeline, background,
+            cam_type=cam_type,
+            override_color=override_color,
+            override_opacity=override_opacity
+        )
+        rendering = pkg["render"].detach()   # [3,H,W]
+        depth     = pkg["depth"].detach()    # [1,H,W] or [H,W]
 
-            rendering = render_pkg["render"]
-            depth = render_pkg["depth"]
-            depth_tensor = []
+        # ---- aria fix (unchanged) ----
+        if aria:
+            rendering = rendering.permute(1, 2, 0)
+            rendering = torch.rot90(rendering, k=3, dims=(0, 1))
+            rendering = rendering.permute(2, 0, 1)
+            d = depth.squeeze().cpu().numpy()
+            d = np.rot90(d, k=3, axes=(0,1))
+            d_vis = d / max(d.max(), 1e-6)
+            depth_vis = torch.from_numpy(np.repeat(d_vis[..., None], 3, axis=2)).permute(2, 0, 1)
+            depth_tensor = torch.from_numpy(d.copy())
+        else:
+            d = depth.squeeze().cpu()
+            d_vis = d / max(d.max().item(), 1e-6)
+            depth_vis = d_vis.unsqueeze(0).repeat(3, 1, 1)
+            depth_tensor = d.cpu()
 
-            # Convert to float16 to save memory and move to CPU to free GPU memory
-            rendering = rendering.half().cpu()
-            depth = depth.half().cpu()
+        if W is None or H is None:
+            H, W = rendering.shape[-2], rendering.shape[-1]
 
-            # Correct for aria's innate rotation
+        # collect tensors
+        rgb_render_list.append(rendering.half().cpu())
+        depth_render_vis_list.append(depth_vis.half())
+        depth_render_tensor_list.append(depth_tensor)
+
+        # RGB GT
+        if cam_type != "PanopticSports":
+            gt_rgb = view.original_image[0:3, :, :].detach()
             if aria:
-                # Rotate the rendered image if aria correction is required
-                rendering = rendering.permute(1, 2, 0)  # Convert to shape (H, W, C)
-                rendering = torch.rot90(rendering, k=3, dims=(0, 1))  # Rotate 270 degrees (k=3)
-                rendering = rendering.permute(2, 0, 1)  # Convert back to shape (C, H, W)
+                gt_rgb = gt_rgb.permute(1, 2, 0)
+                gt_rgb = torch.rot90(gt_rgb, k=3, dims=(0, 1))
+                gt_rgb = gt_rgb.permute(2, 0, 1)
+            rgb_gt_list.append(gt_rgb.half().cpu())
+        else:
+            rgb_gt_list.append(view['image'].half().cpu())
 
-                # Rotate the rendered image if aria correction is required
-                depth_np = depth.permute(1, 2, 0).numpy()  # Convert to shape (H, W, C)
-                depth_np = np.rot90(depth_np, k=3, axes=(0,1))
-                depth_image_np = np.repeat(depth_np, 3, axis=2)
-                depth_image_np /= depth_image_np.max()
-                depth_image = torch.from_numpy(depth_image_np.copy()).permute(2, 0, 1)  # Convert back to shape (C, H, W)
-                depth_tensor = torch.from_numpy(depth_np.copy()).permute(2, 0, 1).squeeze()  # Convert back to shape (C, H, W) and then (H, W)
-                
+        # final filename stem for this view
+        names.append(_filename_stem(view, idx))
 
-            # Append rendering to the CPU-based list
-            render_list.append(rendering)
-            depth_render_list.append(depth_image)
-            depth_render_tensor_list.append(depth_tensor)
+    if len(views) > 1:
+        t1 = time()
+        print("FPS:", (len(views) - 1) / max(t1 - t0, 1e-6))
 
-            if name in ["train", "test", "video", "final_train_render", "color_by_movement"]:
-                if cam_type != "PanopticSports":
-                    gt = view.original_image[0:3, :, :]
-                    if aria:
-                        # Rotate the GT image if aria correction is required
-                        gt = gt.permute(1, 2, 0)  # Convert to shape (H, W, C)
-                        gt = torch.rot90(gt, k=3, dims=(0, 1))  # Rotate 270 degrees (k=3)
-                        gt = gt.permute(2, 0, 1)  # Convert back to shape (C, H, W)
-                    
-                    if hasattr(view,"depth_image"):
-                        depth_gt = view.depth_image
+    # ---- write using names ----
+    _write_png_named(rgb_render_list, names, render_path)
+    _write_png_named(rgb_gt_list, names, gts_path)
+    _write_png_named(depth_render_vis_list, names, depth_render_path)
+    _save_tensors_named(depth_render_tensor_list, names, depth_render_tensors_path)
 
-                        if aria:
-                            # Rotate the GT image if aria correction is required
-                            depth_gt_image = np.dstack([depth_gt.numpy()]*3)
-                            depth_gt_image /= depth_gt_image.max()
-                            depth_gt_image = np.rot90(depth_gt_image,k=3,axes=(0,1))
-                            depth_gt_tensor = np.rot90(depth_gt.numpy(),k=3)
-                            depth_gt_image = torch.from_numpy(depth_gt_image.copy()).permute(2, 0, 1)  # Convert back to shape (C, H, W)
-                            depth_gt_tensor = torch.from_numpy(depth_gt_tensor.copy())  # Convert back to shape (C, H, W)
+    # manifest (unchanged shape)
+    manifest = {
+        "source_path": source_path,
+        "image_names": names,  # these are the actual stems used on disk
+        "width": W, "height": H,
+        "cam_type": cam_type
+    }
+    with open(os.path.join(run_dir, "render_manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
 
-                else:
-                    gt = view['image']
-                    if aria:
-                        # Rotate the GT image if aria correction is required
-                        gt = gt.permute(1, 2, 0)  # Convert to shape (H, W, C)
-                        gt = torch.rot90(gt, k=3, dims=(0, 1))  # Rotate 270 degrees (k=3)
-                        gt = gt.permute(2, 0, 1)  # Convert back to shape (C, H, W)
+    # optionally materialize true GT depth now
+    if write_true_depth_gt and source_path is not None:
+        try:
+            ensure_true_depth_gt(run_dir, source_path, names, (W, H))
+        except Exception as e:
+            print(f"[WARN] ensure_true_depth_gt failed: {e}")
 
-                # Move GT to CPU and half precision
-                gt = gt.half().cpu()
+    try:
+        _write_fixed_jet_from_tensors(run_dir, names, vmin=0.0, vmax=2.5)
+    except Exception as e:
+        print(f"[WARN] fixed-range depth vis failed: {e}")
 
-                # Append GT to the CPU-based list
-                gt_list.append(gt)
-                gt_depth_list.append(depth_gt_image)
-                gt_depth_tensor_list.append(depth_gt_tensor)
+    # videos: sort numerically if possible, else lexicographically
+    if make_videos:
+        def _sort_names(ns):
+            try:
+                return sorted(ns, key=lambda s: int(s))
+            except Exception:
+                return sorted(ns)
 
-            # Clear GPU memory
-            torch.cuda.empty_cache()
-
-    time2 = time()
-    print("FPS:", (len(views) - 1) / (time2 - time1))
-
-    # Save the images using multithreaded writing to speed up the process
-    multithread_write(gt_depth_list, depth_gts_path)
-    multithread_write(depth_render_list, depth_render_path)
-
-    multithread_save_tensors(gt_depth_tensor_list, depth_gts_tensors_path)
-    multithread_save_tensors(depth_render_tensor_list, depth_render_tensors_path)
-
-    multithread_write(gt_list, gts_path)
-    multithread_write(render_list, render_path)
-
-    # Create video from the saved images
-    Path(os.path.join(model_path, name, "ours_{}".format(iteration))).mkdir(parents=True, exist_ok=True)
-    render_images = [imageio.imread(os.path.join(render_path, f'{i:05d}.png')) for i in range(len(views))]
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
-
-    depth_render_images = [imageio.imread(os.path.join(depth_render_path, f'{i:05d}.png')) for i in range(len(views))]
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_depth.mp4'), depth_render_images, fps=30)
+        sorted_names = _sort_names(names)
+        imgs = [imageio.imread(os.path.join(render_path, f"{n}.png")) for n in sorted_names]
+        imageio.mimwrite(os.path.join(run_dir, 'video_rgb.mp4'), imgs, fps=15)
+        dimgs = [imageio.imread(os.path.join(depth_render_path, f"{n}.png")) for n in sorted_names]
+        imageio.mimwrite(os.path.join(run_dir, 'video_depth.mp4'), dimgs, fps=15)
 
 
+def render_all_splits(
+    model_path: str,
+    iteration: int,
+    scene,
+    gaussians,
+    pipeline,
+    background,
+    cam_type: str,
+    render_func,                     # e.g. render_with_dynamic_gaussians_mask
+    aria: bool = False,
+    subroot: str = "final_split_renders",
+    source_path: str = None,
+):
+    """
+    Convenience wrapper: renders several subsets with original filenames:
+      - sequence_full (all views)  [videos on]
+      - split_train
+      - split_test
+      - split_eval_static
+      - split_eval_dynamic
+    """
 
-def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, aria: bool, checkpoint = None):
+    # 1) full sequence
+    render_set_no_compression(
+        model_path, "final_sequence_render", iteration,
+        scene.getTrainCameras() + scene.getTestCameras(),
+        gaussians, pipeline, background, cam_type, aria=aria,
+        render_func=render_func, subdir="sequence_full",
+        use_original_filenames=True, make_videos=True,
+        source_path=source_path, write_true_depth_gt=True
+    )
+
+    split_cfg = load_splits_if_available(source_path or "")
+    if split_cfg is None:
+        print("[split render] no splits directory found; skipping per-split renders.")
+        return
+
+    # All frames ordered as in readColmapSceneInfo
+    all_cams: List = list(scene.getTrainCameras()) + list(scene.getTestCameras())
+    if not all_cams:
+        all_cams = list(scene.getTrainCameras())
+
+    def _do(indices: List[int], suffix: str):
+        cams = select_by_indices(all_cams, indices)
+        if not cams:
+            print(f"[split render] split '{suffix}' is empty; skipping.")
+            return
+        # Use the new args your render function supports (subdir + true depth GT)
+        render_set_no_compression(
+            model_path,
+            subroot,                 # parent name
+            iteration,
+            cams,
+            gaussians,
+            pipeline,
+            background,
+            cam_type,
+            aria=aria,
+            render_func=render_func,
+            subdir=f"split_{suffix}",
+            use_original_filenames=True,
+            make_videos=False,
+            source_path=source_path,
+            write_true_depth_gt=True
+        )
+
+    _do(split_cfg["train"],        "train")
+    _do(sorted(set(split_cfg["eval_static"]) | set(split_cfg["eval_dynamic"])), "test")
+    _do(split_cfg["eval_static"],  "eval_static")
+    _do(split_cfg["eval_dynamic"], "eval_dynamic")
+
+def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)
-
-        if checkpoint is not None:
-            scene = Scene(dataset, gaussians, load_coarse=None)
-        else:
-            scene = Scene(dataset, gaussians, load_iteration=iteration, load_coarse=None, shuffle=False)
-
-
+        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         cam_type=scene.dataset_type
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        if checkpoint is not None:
-                (model_params, first_iter) = torch.load(checkpoint)
-                gaussians.restore(model_params, None)
-                scene.loaded_iter = first_iter
-
-        if hasattr(gaussians,"_dynamic_xyz"):
-            render_func = render_with_dynamic_gaussians_mask
-
-        else:
-            render_func = render
         if not skip_train:
-            render_set_no_compression(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background,cam_type,aria,render_func=render_func)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background,cam_type)
+
         if not skip_test:
-            render_set_no_compression(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background,cam_type,aria,render_func=render_func)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background,cam_type)
         if not skip_video:
-            render_set_no_compression(dataset.model_path,"video",scene.loaded_iter,scene.getVideoCameras(),gaussians,pipeline,background,cam_type,aria,render_func=render_func)
-
-
+            render_set(dataset.model_path,"video",scene.loaded_iter,scene.getVideoCameras(),gaussians,pipeline,background,cam_type)
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")

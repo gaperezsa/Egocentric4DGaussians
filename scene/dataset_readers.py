@@ -21,6 +21,7 @@ from scene.hyper_loader import Load_hyper_data, format_hyper_data
 import torchvision.transforms as transforms
 import copy
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from utils.split_utils import load_splits_if_available, select_by_indices
 import numpy as np
 import torch
 import json
@@ -178,6 +179,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+
 def readColmapSceneInfo(path, images, eval, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
@@ -189,16 +191,41 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
-    reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+
+    reading_dir = "images" if images is None else images
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir)
+    )
+
+    # IMPORTANT: keep a stable order for frame index semantics
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+
+    # ---- SPLITS: simple, read when needed ----
+    split_cfg = load_splits_if_available(path)
+
     if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        #close_train_cam_infos = [c for c in train_cam_infos if (c.depth_image < 1.0).sum().item() > c.depth_image.nelement() * 0.05]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        if split_cfg is not None:
+            # explicit split files
+            train_cam_infos      = select_by_indices(cam_infos, split_cfg["train"])
+            eval_static_cams     = select_by_indices(cam_infos, split_cfg["eval_static"])
+            eval_dynamic_cams    = select_by_indices(cam_infos, split_cfg["eval_dynamic"])
+            # 'test' = union of static+dynamic (order preserved by indices)
+            test_ids = sorted(set(split_cfg["eval_static"]) | set(split_cfg["eval_dynamic"]))
+            test_cam_infos = select_by_indices(cam_infos, test_ids)
+        else:
+            # fallback (keep your previous policy; you can change to even/odd if you prefer)
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+            test_cam_infos  = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            eval_static_cams  = []
+            eval_dynamic_cams = []
     else:
-        train_cam_infos = cam_infos
-        test_cam_infos = []
+        train_cam_infos   = cam_infos
+        test_cam_infos    = []
+        eval_static_cams  = []
+        eval_dynamic_cams = []
+
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
@@ -211,21 +238,21 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
-    
     try:
         pcd = fetchPly(ply_path)
-        
     except:
         pcd = None
-    
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           #close_train_cameras = close_train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           video_cameras=train_cam_infos,
-                           maxtime=0,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        video_cameras=train_cam_infos,
+        maxtime=0,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path
+    )
+
     return scene_info
 def generateCamerasFromTransforms(path, template_transformsfile, extension, maxtime):
     trans_t = lambda t : torch.Tensor([
