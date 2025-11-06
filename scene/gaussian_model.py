@@ -199,12 +199,23 @@ class GaussianModel:
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
         self._lr_static  = training_args.static_position_lr_init*self.spatial_lr_scale
         self._lr_dynamic = training_args.dynamic_position_lr_init*self.spatial_lr_scale
+        
+        # Save existing optimizer state BEFORE recreating
+        old_optimizer_state = None
+        old_param_to_state = {}
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            old_optimizer_state = self.optimizer.state_dict()
+            # Create a mapping: parameter_id -> state for ALL parameters
+            for param, state in self.optimizer.state.items():
+                param_id = id(param)
+                old_param_to_state[param_id] = state
 
         def _dynamic_grad_hook(grad):
             # grad: [N, 3]
             m = self._dynamic_xyz.view(-1,1).to(grad.device)  # [N,1]
             # broadcast: dynamic rows get dynamic LR, static get static LR
-            return grad * (m * self._lr_dynamic + (~m) * self._lr_static)
+            scale_factors = m * self._lr_dynamic + (~m) * self._lr_static
+            grad.mul_(scale_factors)
         
         if stage in ("background_depth","background_RGB"):
             # 1) sanity check
@@ -212,9 +223,8 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook even if already existing
+            # Register hook
             self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
@@ -251,9 +261,8 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook even if already existing
+            # Register hook
             self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz],'lr': 1.0,"name": "xyz"},
@@ -290,9 +299,8 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook even if already existing
+            # Register hook
             self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz], 'lr': 0.0, "name": "xyz"},
@@ -330,9 +338,8 @@ class GaussianModel:
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
 
-            # Register hook even if already existing
+            # Register hook
             self._xyz.register_hook(_dynamic_grad_hook)
-            self._xyz._has_dynamic_hook = True
 
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
@@ -364,7 +371,43 @@ class GaussianModel:
 
 
 
+        # Create new optimizer
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        
+        # Restore optimizer momentum/variance state from previous stage
+        should_restore_state = (stage != "fine_coloring")
+        
+        if old_param_to_state and should_restore_state:
+            try:
+                restored_count = 0
+                
+                # For each parameter in the new optimizer, try to restore its state
+                for group in self.optimizer.param_groups:
+                    for new_param in group['params']:
+                        new_param_id = id(new_param)
+                        
+                        # Check if we have saved state for this exact parameter object
+                        if new_param_id in old_param_to_state:
+                            old_state = old_param_to_state[new_param_id]
+                            # Copy the momentum and variance buffers
+                            self.optimizer.state[new_param] = old_state
+                            restored_count += 1
+                
+                if restored_count > 0:
+                    print(f"✓ Restored optimizer state for {restored_count} parameters when transitioning to '{stage}' stage")
+                    
+            except Exception as e:
+                print(f"⚠ Could not restore optimizer state: {e}")
+
+    def initialize_learning_rates(self, iteration=0):
+        ''' Initialize learning rates from scheduler at stage transition '''
+        # This ensures _lr_static and _lr_dynamic match the scheduler's initial values
+        # before any gradient steps are applied through the hook
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "xyz":
+                self._lr_static  = self.static_xyz_scheduler_args(iteration)
+                self._lr_dynamic = self.dynamic_xyz_scheduler_args(iteration)
+                print(f"[LR INIT] iteration={iteration}, _lr_static={self._lr_static:.6e}, _lr_dynamic={self._lr_dynamic:.6e}")
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''

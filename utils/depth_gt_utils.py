@@ -205,7 +205,6 @@ def ensure_true_depth_gt(
         avi_path = sources[0]
         # try ffmpeg → PNGs in a temp folder inside run_dir
         frames_dir_tmp = run / "_true_depth_frames_tmp"
-        breakpoint()
         if _ffmpeg_available():
             try:
                 _decode_avi_to_frames(avi_path, frames_dir_tmp)

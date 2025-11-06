@@ -65,6 +65,12 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
     # Setup learning rates based on stage
     gaussians.training_setup(opt, stage)
 
+    #Initialize learning rates immediately to prevent gradient explosions at transition
+    gaussians.initialize_learning_rates(iteration=0)
+    
+    # When transitioning between stages, the optimizer.zero_grad() from the last iteration
+    gaussians.optimizer.zero_grad(set_to_none=True)
+
     rendering_only_background_or_only_dynamic = stage != "fine_coloring"
     depth_only_stage = stage in ("background_depth", "dynamics_depth")
     hyper.general_depth_weight = 1e-5 # temporary weight
@@ -318,6 +324,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
             os.execv(sys.executable, [sys.executable] + sys.argv)
+        
         loss.backward()
 
         #kill grad of no dynamic gaussians
