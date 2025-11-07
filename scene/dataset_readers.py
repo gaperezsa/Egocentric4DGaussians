@@ -43,6 +43,7 @@ class CameraInfo(NamedTuple):
     depth_image: np.array
     depth_path: str
     dynamic_mask: torch.tensor
+    normal_map: np.array
     width: int
     height: int
     time : float
@@ -135,6 +136,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         image_name = os.path.basename(image_path).split(".")[0]
         depth_path = image_path.split("colmap")[0] + "depth/" + image_name.replace("camera_rgb","camera_depth") + ".png"
         dynamic_masks_path = image_path.split("colmap")[0] + "dynamic_masks/" + image_name.replace("camera_rgb","camera_dynamics") + ".npy"
+        normal_path = image_path.split("colmap")[0] + "normals/" + image_name.replace("camera_rgb","camera_normal") + ".npy"
 
         depth_image = None
         if os.path.isfile(depth_path):
@@ -144,9 +146,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         dynamic_mask = None
         if os.path.isfile(dynamic_masks_path):
             dynamic_mask = torch.from_numpy(np.load(dynamic_masks_path)).type(torch.bool)
+        
+        normal_map = None
+        if os.path.isfile(normal_path):
+            normal_np = np.load(normal_path).astype(np.float32)  # (H, W, 3) in range [-1, 1]
+            normal_map = torch.from_numpy(normal_np).permute(2, 0, 1)  # Convert to (3, H, W)
             
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                image_path=image_path, image_name=image_name, depth_image=depth_image, depth_path=depth_path, dynamic_mask=dynamic_mask,  width=width, height=height,
+                                image_path=image_path, image_name=image_name, depth_image=depth_image, depth_path=depth_path, 
+                                dynamic_mask=dynamic_mask, normal_map=normal_map, width=width, height=height,
                                 time = float(idx/len(cam_extrinsics)), mask=None)
             
         cam_infos.append(cam_info)
@@ -180,7 +188,7 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=2):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -216,8 +224,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
             test_cam_infos = select_by_indices(cam_infos, test_ids)
         else:
             # fallback (keep your previous policy; you can change to even/odd if you prefer)
-            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-            test_cam_infos  = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            test_cam_infos  = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
             eval_static_cams  = []
             eval_dynamic_cams = []
     else:

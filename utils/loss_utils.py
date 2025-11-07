@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from typing import Optional
 import lpips
 def lpips_loss(img1, img2, lpips_model):
     loss = lpips_model(img1,img2)
@@ -244,3 +245,117 @@ def dice_loss(y_pred, y_true, smooth=1e-6):
     
     # Return Dice Loss
     return 1 - dice_coeff
+
+def compute_image_gradient(image: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Compute image gradient magnitude using Sobel filters for DN-Splatter gradient-aware weighting.
+    
+    Args:
+        image: RGB image tensor of shape (3, H, W) or (B, 3, H, W)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Gradient magnitude tensor of shape (H, W) or (B, H, W)
+    """
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    
+    # Convert to grayscale (take mean across channels)
+    if image.shape[1] == 3:
+        gray = image.mean(dim=1, keepdim=True)  # (B, 1, H, W)
+    else:
+        gray = image
+    
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                           dtype=torch.float32, device=image.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                           dtype=torch.float32, device=image.device).view(1, 1, 3, 3)
+    
+    # Apply convolution
+    grad_x = torch.nn.functional.conv2d(gray, sobel_x, padding=1)
+    grad_y = torch.nn.functional.conv2d(gray, sobel_y, padding=1)
+    
+    # Compute gradient magnitude
+    grad_mag = torch.sqrt(grad_x**2 + grad_y**2 + eps)
+    grad_mag = grad_mag.squeeze(1)  # Remove channel dimension
+    
+    if squeeze_output:
+        grad_mag = grad_mag.squeeze(0)
+    
+    return grad_mag
+
+
+def gradient_aware_depth_loss(pred_depth: torch.Tensor, 
+                               gt_depth: torch.Tensor,
+                               rgb_image: Optional[torch.Tensor] = None,
+                               image_gradient: Optional[torch.Tensor] = None,
+                               mask: Optional[torch.Tensor] = None,
+                               depth_threshold: float = 0.001,
+                               eps: float = 1e-8) -> torch.Tensor:
+    """
+    Gradient-aware depth loss from DN-Splatter (Eq. 4).
+    
+    Uses g_rgb = exp(-∇I) to reduce loss at image edges and enforce it more on smooth regions.
+    Applies logarithmic penalty: log(1 + ||pred - gt||_1)
+    
+    Args:
+        pred_depth: Predicted depth map (H, W) or (B, H, W)
+        gt_depth: Ground truth depth map (H, W) or (B, H, W)
+        rgb_image: Aligned RGB image (3, H, W) or (B, 3, H, W). Either this or image_gradient must be provided.
+        image_gradient: Pre-computed image gradient (H, W) or (B, H, W). If provided, rgb_image is ignored.
+        mask: Optional valid depth mask (H, W) or (B, H, W). If None, all valid depths > threshold are used.
+        depth_threshold: Minimum valid depth value
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Scalar loss tensor
+    """
+    # Ensure batch dimension
+    if pred_depth.ndim == 2:
+        pred_depth = pred_depth.unsqueeze(0)
+        gt_depth = gt_depth.unsqueeze(0)
+    
+    # Get gradient magnitude (either pre-computed or compute now)
+    if image_gradient is not None:
+        grad_mag = image_gradient
+        if grad_mag.ndim == 2:
+            grad_mag = grad_mag.unsqueeze(0)
+    else:
+        assert rgb_image is not None, "Either rgb_image or image_gradient must be provided"
+        grad_mag = compute_image_gradient(rgb_image, eps=eps)
+        if grad_mag.ndim == 2:
+            grad_mag = grad_mag.unsqueeze(0)
+    
+    # Compute gradient-aware weight: g_rgb = exp(-∇I)
+    g_rgb = torch.exp(-grad_mag)
+    
+    # Create valid depth mask
+    valid_depth = gt_depth > depth_threshold
+    
+    if mask is not None:
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        valid_mask = torch.logical_and(valid_depth, mask)
+    else:
+        valid_mask = valid_depth
+    
+    # Compute L1 distance
+    l1_dist = torch.abs(pred_depth - gt_depth)
+    
+    # Apply logarithmic penalty: log(1 + L1)
+    log_term = torch.log(1.0 + l1_dist + eps)
+    
+    # Apply gradient-aware weighting
+    weighted_loss = g_rgb * log_term
+    
+    # Average over valid pixels
+    if valid_mask.any():
+        loss = weighted_loss[valid_mask].mean()
+    else:
+        loss = torch.tensor(0.0, device=pred_depth.device)
+    
+    return loss

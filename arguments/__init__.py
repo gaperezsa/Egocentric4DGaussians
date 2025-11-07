@@ -102,6 +102,16 @@ class ModelHiddenParams(ParamGroup):
         self.grid_pe=0
         self.static_mlp=False
         self.apply_rotation=False
+        
+        # DN-Splatter & Depth Loss Weights (all hyperparameters unified here)
+        self.use_gradient_aware_depth = True  # Use gradient-aware depth loss instead of standard L1
+        self.general_depth_weight = 0.01  # Weight for depth supervision (all depth stages)
+        self.chamfer_weight = 50.0  # Weight for Chamfer distance loss (dynamic objects point cloud)
+        self.normal_loss_weight = 0.05  # Weight for normal regularization loss (geometric consistency)
+        self.normal_l1_weight = 1.0  # Weight for normal L1 term within normal loss
+        self.normal_tv_weight = 0.01  # Weight for normal TV smoothness term
+        self.ssim_weight = 0.0  # Weight for SSIM loss (fine_coloring stage, 0 = disabled)
+        self.plane_tv_weight = 0.0001  # Weight for space-time TV regularization (coherence)
 
         
         super().__init__(parser, "ModelHiddenParams")
@@ -111,22 +121,28 @@ class OptimizationParams(ParamGroup):
         self.dataloader=False
         self.zerostamp_init=False
         self.custom_sampler=None
+        # ========== Stage Iterations ==========
         self.background_depth_iterations = 10_000
         self.background_RGB_iterations = 10_000
         self.dynamics_depth_iterations = 10_000
+        self.dynamics_RGB_iterations = 10_000
         self.fine_iterations = 10_000
-        self.dynamic_position_lr_init = 0.0016,
-        self.dynamic_position_lr_final = 0.00016,
-        self.static_position_lr_init = 0.016,
-        self.static_position_lr_final = 0.000016,
+        self.fine_opt_dyn_lr_downscaler = 0.01
+        # ========== Position Learning Rates ==========
+        self.dynamic_position_lr_init = 0.0016
+        self.dynamic_position_lr_final = 0.00016
+        self.static_position_lr_init = 0.016
+        self.static_position_lr_final = 0.000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 20_000
+        # ========== Deformation Learning Rates ==========
         self.deformation_lr_init = 0.00016
         self.deformation_lr_final = 0.000016
         self.deformation_lr_delay_mult = 0.01
+        # ========== Grid Learning Rates ==========
         self.grid_lr_init = 0.0016
         self.grid_lr_final = 0.00016
-
+        # ========== General Learning Rates ==========
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
@@ -134,7 +150,8 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0
         self.lambda_lpips = 0
-        self.weight_constraint_init= 1
+        # ========== Densification & Pruning ==========
+        self.weight_constraint_init = 1
         self.weight_constraint_after = 0.2
         self.weight_decay_iteration = 5000
         self.opacity_reset_interval = 3000
@@ -150,8 +167,9 @@ class OptimizationParams(ParamGroup):
         self.opacity_threshold_coarse = 0.005
         self.opacity_threshold_fine_init = 0.005
         self.opacity_threshold_fine_after = 0.005
-        self.batch_size=1
-        self.add_point=False
+        # ========== Batch & Point Management ==========
+        self.batch_size = 1
+        self.add_point = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

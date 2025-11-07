@@ -17,7 +17,8 @@ import torch
 from random import randint
 from utils.exocentric_utils import compute_exocentric_from_file
 from utils.graphics_utils import getWorld2View2
-from utils.loss_utils import l1_loss, l1_filtered_loss, chamfer_loss, chamfer_with_median, l1_background_colored_masked_loss
+from utils.loss_utils import l1_loss, l1_filtered_loss, chamfer_loss, chamfer_with_median, l1_background_colored_masked_loss, gradient_aware_depth_loss, ssim
+from utils.dn_splatter_utils import normal_regularization_loss, render_normal_map_from_gaussians, scale_regularization_loss
 from gaussian_renderer import render, network_gui, render_with_dynamic_gaussians_mask, render_dynamic_gaussians_mask_and_compare, get_deformed_gaussian_centers
 from render import render_set_no_compression, render_all_splits
 from metrics import evaluate_single_folder
@@ -193,23 +194,29 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        # Prepare batches of images, depths, etc.
+        # ====================================================================
+        # STEP 1: Render and collect data for current batch
+        # ====================================================================
         images, depth_images, dynamic_depth, dynamic_image = [], [], [], []
         dynamic_point_cloud, gt_images = [], []
-        gt_depth_images, gt_dynamic_masks = [], []
+        gt_depth_images, gt_dynamic_masks, gt_normal_maps = [], [], []
         gt_dynamic_point_cloud, radii_list = [], []
         visibility_filter_list, viewspace_point_tensor_list = [], []
-        median_dist = None
+        image_gradients = []  # Cache pre-computed image gradients
+        rendered_normal_maps = []  # Rendered normals (only for normal loss stages)
 
         for viewpoint_cam in viewpoint_cams:
             viewpoint_cam.to_device("cuda")
             if viewpoint_cam.depth_image is None:
                 continue
 
+            # Special case: dynamics_depth stage only needs point clouds
             if stage == "dynamics_depth":
                 dynamic_point_cloud.append(get_deformed_gaussian_centers(viewpoint_cam, gaussians))
                 gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
                 continue
+            
+            # Render RGB and depth for this viewpoint
             pkg = render_with_dynamic_gaussians_mask(
                 viewpoint_cam, gaussians, pipe, background,
                 stage=stage, cam_type=scene.dataset_type,
@@ -218,90 +225,301 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             image, depth_image = pkg["render"], pkg["depth"]
             viewspace_point_tensor, visibility_filter, radii = pkg["viewspace_points"], pkg["visibility_filter"], pkg["radii"]
 
-            # Handle RGB ground truth
+            # Collect ground truth RGB (needed for gradient-aware losses)
+            gt_image = viewpoint_cam.original_image if scene.dataset_type != "PanopticSports" else viewpoint_cam['image']
+            gt_images.append(gt_image.unsqueeze(0))
+            
+            # Cache image gradient (computed once per camera, reused for gradient-aware losses)
+            image_gradients.append(viewpoint_cam.get_image_gradient().unsqueeze(0))
+            
+            # Collect rendered RGB (only for RGB stages)
             if stage in ("background_RGB", "dynamics_RGB", "fine_coloring"):
-                gt_image = viewpoint_cam.original_image if scene.dataset_type != "PanopticSports" else viewpoint_cam['image']
-                images.append(image.unsqueeze(0)); gt_images.append(gt_image.unsqueeze(0))
+                images.append(image.unsqueeze(0))
 
+            # Always collect masks and depth
             gt_dynamic_masks.append(viewpoint_cam.dynamic_mask.unsqueeze(0))
-            depth_images.append(depth_image.squeeze().unsqueeze(0)); gt_depth_images.append(viewpoint_cam.depth_image.unsqueeze(0))
+            depth_images.append(depth_image.squeeze().unsqueeze(0))
+            gt_depth_images.append(viewpoint_cam.depth_image.unsqueeze(0))
+            
+            # Collect ground truth normal maps (only if available)
+            if viewpoint_cam.normal_map is not None:
+                gt_normal_maps.append(viewpoint_cam.normal_map.unsqueeze(0))
+                
+                # Render normal map from Gaussians (only for normal loss stages)
+                if stage in ("background_depth", "background_RGB", "fine_coloring") and hyper.normal_loss_weight > 0:
+                    rendered_normals, _, _ = render_normal_map_from_gaussians(
+                        gaussians, viewpoint_cam, pipe, background, stage=stage, cam_type=scene.dataset_type
+                    )
+                    rendered_normal_maps.append(rendered_normals.unsqueeze(0))
 
+            # Collect dynamic-specific renders (only for dynamics stages)
             if pkg.get("dynamic_only_render") is not None:
                 dynamic_image.append(pkg["dynamic_only_render"].unsqueeze(0))
                 dynamic_depth.append(pkg["dynamic_only_depth"].squeeze().unsqueeze(0))
                 dynamic_point_cloud.append(pkg["dynamic_3D_means"].squeeze().cuda())
                 gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
 
+            # Collect densification stats
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
         
         
-        # Loss
-        Ll1 = torch.tensor(0)
-        depth_loss = torch.tensor(0)
-        dynamic_mask_loss = torch.tensor(0)
+        # ====================================================================
+        # STEP 2: Prepare tensors (concatenate batched data)
+        # ====================================================================
+        # Initialize all losses (unweighted, raw values)
+        Ll1 = torch.tensor(0.0, device="cuda")
+        depth_loss = torch.tensor(0.0, device="cuda")
+        dynamic_mask_loss = torch.tensor(0.0, device="cuda")
+        normal_loss = torch.tensor(0.0, device="cuda")
+        scale_loss = torch.tensor(0.0, device="cuda")
+        ssim_loss_val = torch.tensor(0.0, device="cuda")
+        local_tv_loss = torch.tensor(0.0, device="cuda")
 
+        # Concatenate common tensors (except for dynamics_depth stage)
         if stage != "dynamics_depth":
-            gt_dynamic_masks_tensor = torch.cat(gt_dynamic_masks,0)
-
-            depth_image_tensor = torch.cat(depth_images,0)
-            gt_depth_image_tensor = torch.cat(gt_depth_images,0)
-
-            radii = torch.cat(radii_list,0).max(dim=0).values
+            gt_dynamic_masks_tensor = torch.cat(gt_dynamic_masks, 0)
+            depth_image_tensor = torch.cat(depth_images, 0)
+            gt_depth_image_tensor = torch.cat(gt_depth_images, 0)
+            radii = torch.cat(radii_list, 0).max(dim=0).values
             visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
         
-        # RGB loss
-        if stage == "background_RGB" or stage == "dynamics_RGB" or stage == "fine_coloring":
-            image_tensor = torch.cat(images,0)
-            gt_image_tensor = torch.cat(gt_images,0)
-            if stage == "background_RGB":
-                mask = (~gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
-                Ll1 = l1_filtered_loss(image_tensor, gt_image_tensor[:,:3,:,:], mask)
-            elif stage == "dynamics_RGB":
-                mask = (gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
-                dynamic_image_tensor = torch.cat(dynamic_image,0)
-                Ll1 = l1_background_colored_masked_loss(dynamic_image_tensor, gt_image_tensor[:,:3,:,:], mask, background)
-            elif stage == "fine_coloring":
-                Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-
-        # Depth and depth-related losses
-        if stage == "background_depth":
-            if iteration < opt.densify_from_iter:
-                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor, reduction="mean")
-            else:
-                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor, reduction="sum")
-                depth_loss = hyper.general_depth_weight * depth_loss
-        elif stage == "background_RGB":
-            depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, ~gt_dynamic_masks_tensor, reduction="sum")
-            depth_loss = hyper.general_depth_weight * depth_loss
-        elif stage == "dynamics_depth":
-            dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
-        elif stage == "dynamics_RGB":
-            dynamic_only_depth_image_tensor = torch.cat(dynamic_depth,0)
-
-            dynamic_mask_loss, median_dist = chamfer_with_median(dynamic_point_cloud, gt_dynamic_point_cloud)
-            dynamic_mask_loss = opt.chamfer_weight * dynamic_mask_loss
-
-            
-            # gt_dynamic_masks_tensor has shape (bs, H, W), depth_image_tensor & gt_depth_image_tensor also (bs, H, W)
-            zero_depth = torch.zeros_like(gt_depth_image_tensor)
-            masked_gt_depth = torch.where(
-                gt_dynamic_masks_tensor,        # inside dynamic mask
-                gt_depth_image_tensor,          # keep true depth
-                zero_depth                      # else set to 0
-            )
-            depth_loss = l1_loss(dynamic_only_depth_image_tensor, masked_gt_depth)
-            depth_loss = hyper.general_depth_weight * depth_loss
-
-        elif stage == "fine_coloring":
-            depth_loss = 0.5 * hyper.general_depth_weight * l1_loss(depth_image_tensor, gt_depth_image_tensor)
-
+        # Concatenate image gradient tensor if available
+        image_gradient_tensor = None
+        if hyper.use_gradient_aware_depth and len(image_gradients) > 0:
+            image_gradient_tensor = torch.cat(image_gradients, 0)
         
-        loss = Ll1 + depth_loss + dynamic_mask_loss
+        
+        # ====================================================================
+        # STEP 3: Compute losses per stage (UNWEIGHTED, organized by stage)
+        # ====================================================================
+        
+        # ------------------ STAGE: background_depth ------------------
+        if stage == "background_depth":
+            # Depth loss: static regions only
+            mask = ~gt_dynamic_masks_tensor
+            if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                depth_loss = gradient_aware_depth_loss(
+                    depth_image_tensor, gt_depth_image_tensor,
+                    image_gradient=image_gradient_tensor, mask=mask
+                )
+            else:
+                # Standard L1 depth loss
+                reduction = "mean" if iteration < opt.densify_from_iter else "sum"
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, mask, reduction=reduction)
+            
+            # Normal loss: static regions only
+            if len(rendered_normal_maps) > 0 and len(gt_normal_maps) > 0:
+                rendered_normals_tensor = torch.cat(rendered_normal_maps, 0)
+                gt_normals_tensor = torch.cat(gt_normal_maps, 0)
+                normal_mask = ~gt_dynamic_masks_tensor  # Only static regions
+                
+                if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                    normal_loss, _ = normal_regularization_loss(
+                        pred_normals=rendered_normals_tensor,
+                        gt_normals=gt_normals_tensor,
+                        image_gradient=image_gradient_tensor,
+                        mask=normal_mask,
+                        lambda_l1=hyper.normal_l1_weight,
+                        lambda_tv=hyper.normal_tv_weight,
+                        use_gradient_aware=True
+                    )
+                else:
+                    normal_loss, _ = normal_regularization_loss(
+                        pred_normals=rendered_normals_tensor,
+                        gt_normals=gt_normals_tensor,
+                        mask=normal_mask,
+                        lambda_l1=hyper.normal_l1_weight,
+                        lambda_tv=hyper.normal_tv_weight,
+                        use_gradient_aware=False
+                    )
+            
+            # Scale regularization: encourage disc-like Gaussians
+            if hyper.normal_loss_weight > 0:
+                scale_loss = scale_regularization_loss(gaussians.get_scaling, lambda_scale=0.01)
+        
+        # ------------------ STAGE: background_RGB ------------------
+        elif stage == "background_RGB":
+            # RGB loss: static regions only
+            image_tensor = torch.cat(images, 0)
+            gt_image_tensor = torch.cat(gt_images, 0)
+            mask = (~gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
+            Ll1 = l1_filtered_loss(image_tensor, gt_image_tensor[:, :3, :, :], mask)
+            
+            # Depth loss: static regions only
+            depth_mask = ~gt_dynamic_masks_tensor
+            if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                depth_loss = gradient_aware_depth_loss(
+                    depth_image_tensor, gt_depth_image_tensor,
+                    image_gradient=image_gradient_tensor, mask=depth_mask
+                )
+            else:
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, depth_mask, reduction="sum")
+            
+            # Normal loss: static regions only
+            if len(rendered_normal_maps) > 0 and len(gt_normal_maps) > 0:
+                rendered_normals_tensor = torch.cat(rendered_normal_maps, 0)
+                gt_normals_tensor = torch.cat(gt_normal_maps, 0)
+                normal_mask = ~gt_dynamic_masks_tensor
+                
+                if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                    normal_loss, _ = normal_regularization_loss(
+                        pred_normals=rendered_normals_tensor,
+                        gt_normals=gt_normals_tensor,
+                        image_gradient=image_gradient_tensor,
+                        mask=normal_mask,
+                        lambda_l1=hyper.normal_l1_weight,
+                        lambda_tv=hyper.normal_tv_weight,
+                        use_gradient_aware=True
+                    )
+                else:
+                    normal_loss, _ = normal_regularization_loss(
+                        pred_normals=rendered_normals_tensor,
+                        gt_normals=gt_normals_tensor,
+                        mask=normal_mask,
+                        lambda_l1=hyper.normal_l1_weight,
+                        lambda_tv=hyper.normal_tv_weight,
+                        use_gradient_aware=False
+                    )
+            
+            # Scale regularization
+            if hyper.normal_loss_weight > 0:
+                scale_loss = scale_regularization_loss(gaussians.get_scaling, lambda_scale=0.01)
+        
+        # ------------------ STAGE: dynamics_depth ------------------
+        elif stage == "dynamics_depth":
+            # Chamfer loss on dynamic point clouds
+            dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
+        
+        # ------------------ STAGE: dynamics_RGB ------------------
+        elif stage == "dynamics_RGB":
+            # RGB loss: dynamic regions only
+            image_tensor = torch.cat(images, 0)
+            gt_image_tensor = torch.cat(gt_images, 0)
+            dynamic_image_tensor = torch.cat(dynamic_image, 0)
+            mask = (gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
+            Ll1 = l1_background_colored_masked_loss(dynamic_image_tensor, gt_image_tensor[:, :3, :, :], mask, background)
+            
+            # Chamfer loss with median distance
+            dynamic_mask_loss, median_dist = chamfer_with_median(dynamic_point_cloud, gt_dynamic_point_cloud)
+            
+            # Depth loss: dynamic regions only (masked GT depth)
+            dynamic_only_depth_image_tensor = torch.cat(dynamic_depth, 0)
+            zero_depth = torch.zeros_like(gt_depth_image_tensor)
+            masked_gt_depth = torch.where(gt_dynamic_masks_tensor, gt_depth_image_tensor, zero_depth)
+            
+            if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                depth_loss = gradient_aware_depth_loss(
+                    dynamic_only_depth_image_tensor, masked_gt_depth,
+                    image_gradient=image_gradient_tensor, mask=gt_dynamic_masks_tensor
+                )
+            else:
+                depth_loss = l1_loss(dynamic_only_depth_image_tensor, masked_gt_depth)
+            
+            # Local space-time TV regularization
+            if hyper.plane_tv_weight > 0:
+                local_tv_loss = gaussians.compute_local_spacetime_tv()
+        
+        # ------------------ STAGE: fine_coloring ------------------
+        elif stage == "fine_coloring":
+            # RGB loss: full image
+            image_tensor = torch.cat(images, 0)
+            gt_image_tensor = torch.cat(gt_images, 0)
+            Ll1 = l1_loss(image_tensor, gt_image_tensor[:, :3, :, :])
+            
+            # Depth loss: full image (with 0.5 weight factor)
+            if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                depth_loss = 0.5 * gradient_aware_depth_loss(
+                    depth_image_tensor, gt_depth_image_tensor,
+                    image_gradient=image_gradient_tensor, mask=None
+                )
+            else:
+                depth_loss = 0.5 * l1_loss(depth_image_tensor, gt_depth_image_tensor)
+            
+            # Normal loss: static regions only
+            if len(rendered_normal_maps) > 0 and len(gt_normal_maps) > 0:
+                rendered_normals_tensor = torch.cat(rendered_normal_maps, 0)
+                gt_normals_tensor = torch.cat(gt_normal_maps, 0)
+                normal_mask = ~gt_dynamic_masks_tensor
+                
+                if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
+                    normal_loss, _ = normal_regularization_loss(
+                        pred_normals=rendered_normals_tensor,
+                        gt_normals=gt_normals_tensor,
+                        image_gradient=image_gradient_tensor,
+                        mask=normal_mask,
+                        lambda_l1=hyper.normal_l1_weight,
+                        lambda_tv=hyper.normal_tv_weight,
+                        use_gradient_aware=True
+                    )
+                else:
+                    normal_loss, _ = normal_regularization_loss(
+                        pred_normals=rendered_normals_tensor,
+                        gt_normals=gt_normals_tensor,
+                        mask=normal_mask,
+                        lambda_l1=hyper.normal_l1_weight,
+                        lambda_tv=hyper.normal_tv_weight,
+                        use_gradient_aware=False
+                    )
+            
+            # Scale regularization
+            if hyper.normal_loss_weight > 0:
+                scale_loss = scale_regularization_loss(gaussians.get_scaling, lambda_scale=0.01)
+            
+            # SSIM loss
+            if hyper.ssim_weight != 0:
+                ssim_loss_val = 1.0 - ssim(image_tensor, gt_image_tensor)
+            
+            # Local space-time TV regularization
+            if hyper.plane_tv_weight > 0:
+                local_tv_loss = gaussians.compute_local_spacetime_tv()
+        
+        # ====================================================================
+        # STEP 4: Combine all losses with weights
+        # ====================================================================
+        loss = Ll1 \
+             + hyper.general_depth_weight * depth_loss \
+             + hyper.chamfer_weight * dynamic_mask_loss \
+             + hyper.normal_loss_weight * normal_loss \
+             + scale_loss \
+             + hyper.ssim_weight * ssim_loss_val \
+             + hyper.plane_tv_weight * local_tv_loss
 
+        # ====================================================================
+        # Log loss magnitudes and weighted contributions (every N iterations)
+        # ====================================================================
+        if iteration % 100 == 0:
+            # Compute weighted contributions
+            weighted_depth = hyper.general_depth_weight * depth_loss.item()
+            weighted_chamfer = hyper.chamfer_weight * dynamic_mask_loss.item()
+            weighted_normal = hyper.normal_loss_weight * normal_loss.item()
+            weighted_ssim = hyper.ssim_weight * ssim_loss_val.item()
+            weighted_tv = hyper.plane_tv_weight * local_tv_loss.item()
+            
+            print(f"\n[ITER {iteration:5d} | Stage: {stage:16s}]")
+            print(f"  RGB Loss:          {Ll1.item():.6f}")
+            if depth_loss.item() > 0:
+                print(f"  Depth Loss:        {depth_loss.item():.6f} × {hyper.general_depth_weight:.6f} = {weighted_depth:.6f}")
+            if dynamic_mask_loss.item() > 0:
+                print(f"  Chamfer Loss:      {dynamic_mask_loss.item():.6f} × {hyper.chamfer_weight:.6f} = {weighted_chamfer:.6f}")
+            if normal_loss.item() > 0:
+                print(f"  Normal Loss:       {normal_loss.item():.6f} × {hyper.normal_loss_weight:.6f} = {weighted_normal:.6f}")
+            if scale_loss.item() > 0:
+                print(f"  Scale Loss:        {scale_loss.item():.6f} (no external weight)")
+            if ssim_loss_val.item() > 0:
+                print(f"  SSIM Loss:         {ssim_loss_val.item():.6f} × {hyper.ssim_weight:.6f} = {weighted_ssim:.6f}")
+            if local_tv_loss.item() > 0:
+                print(f"  Spacetime TV:      {local_tv_loss.item():.6f} × {hyper.plane_tv_weight:.6f} = {weighted_tv:.6f}")
+            print(f"  {'='*50}")
+            print(f"  TOTAL LOSS:        {loss.item():.6f}")
+            print(f"  {'='*50}")
+
+        # ====================================================================
+        # STEP 5: Compute PSNR (only for RGB stages)
+        # ====================================================================
         psnr_ = 0
-        if stage != "background_depth" and stage != "dynamics_depth":
+        if stage not in ("background_depth", "dynamics_depth"):
             psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         
         #if stage != "background_depth" and stage != "background_RGB" and hyper.time_smoothness_weight != 0:
@@ -507,8 +725,7 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                     render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
                 break
     
-    
-    
+
     if  current_stage == stages[0]: 
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
@@ -784,6 +1001,22 @@ def setup_seed(seed):
      np.random.seed(seed)
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
+
+
+def apply_sweep_overrides(op_params, hp_params, args):
+    """
+    Apply command-line argument overrides to parameter objects.
+    This centralizes all parameter assignment logic in one place.
+    
+    Note: All parameters are already defined in OptimizationParams and ModelHiddenParams
+    so they're automatically registered with argparse. This function only needs to be
+    called if using additional custom arguments beyond those classes.
+    """
+    # Optional: Add any custom command-line only arguments here if needed
+    # For now, all args are handled by the ParamGroup classes (OptimizationParams, ModelHiddenParams)
+    return op_params, hp_params
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     # torch.set_default_tensor_type('torch.FloatTensor')
@@ -805,23 +1038,10 @@ if __name__ == "__main__":
     parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
     parser.add_argument("--bs", type=int, default = 16)
 
-    # grid_searched hyperparams
+    # ====================================================================
+    # Grid-searched hyperparameters (Stage iterations)
+    # ====================================================================
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--background_depth_iter", type=int, default = 20000)
-    parser.add_argument("--background_RGB_iter", type=int, default = 14000)
-    parser.add_argument("--dynamics_depth_iter", type=int, default = 10000)
-    parser.add_argument("--dynamics_RGB_iter", type=int, default = 5000)
-    parser.add_argument("--fine_iter", type=int, default = 20000)
-    parser.add_argument("--netork_width", type=int, default = 128)
-    
-    parser.add_argument('--chamfer_weight', type=float, default=50.0)
-    parser.add_argument('--fine_opt_dyn_lr_downscaler', type=float, default=0.01)
-    #parser.add_argument('--pruning_interval', type=float, default=0.01)
-    #parser.add_argument('--densification_interval', type=float, default=0.01)
-    #parser.add_argument('--dynamic_position_lr_init', type=float, default=1e-13)
-    #parser.add_argument('--dynamic_position_lr_final', type=float, default=1e-15)
-    #parser.add_argument('--static_position_lr_init', type=float, default=1e-13)
-    #parser.add_argument('--static_position_lr_final', type=float, default=1e-15)
 
 
     lp = ModelParams(parser)
@@ -830,36 +1050,63 @@ if __name__ == "__main__":
     hp = ModelHiddenParams(parser)
     
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.background_depth_iter)
-    args.save_iterations.append(args.background_RGB_iter)
-    args.save_iterations.append(args.dynamics_depth_iter)
-    args.save_iterations.append(args.dynamics_RGB_iter)
-    args.save_iterations.append(args.fine_iter)
+    args.save_iterations.append(args.background_depth_iterations)
+    args.save_iterations.append(args.background_RGB_iterations)
+    args.save_iterations.append(args.dynamics_depth_iterations)
+    args.save_iterations.append(args.dynamics_RGB_iterations)
+    args.save_iterations.append(args.fine_iterations)
     if args.configs:
         import mmengine
         from utils.params_utils import merge_hparams
         config = mmengine.Config.fromfile(args.configs)
-        args = merge_hparams(args, config)
+        # Pass sys.argv so CLI args take priority over config
+        args = merge_hparams(args, config, cli_args=sys.argv)
     print("Optimizing " + args.model_path)
 
+    # ====================================================================
+    # LOG PARAMETER FLOW - Show where each parameter came from
+    # ====================================================================
+    print("\n" + "="*70)
+    print("PARAMETER FLOW VERIFICATION")
+    print("="*70)
+    print("\n[Config File Source] (arguments/HOI4D/default.py):")
+    print(f"  batch_size: 2 (config default)")
+    print(f"  background_depth_iterations: 500 (config default)")
+    print(f"  pruning_interval: 700 (config default)")
+    print(f"  chamfer_weight: 50.0 (config default)")
+    print(f"  general_depth_weight: 0.01 (config default)")
+    
+    print("\n[CLI Arguments] (what bash script passed):")
+    print(f"  See: {' '.join(sys.argv[1:])}")
+    
+    print("\n[Final Values After Merge] (CLI > Config > Code defaults):")
+    print(f"  batch_size: {args.batch_size}")
+    print(f"  background_depth_iterations: {args.background_depth_iterations}")
+    print(f"  pruning_interval: {args.pruning_interval}")
+    print(f"  chamfer_weight: {args.chamfer_weight}")
+    print(f"  general_depth_weight: {args.general_depth_weight}")
+    print(f"  densification_interval: {args.densification_interval}")
+    print(f"  plane_tv_weight: {args.plane_tv_weight}")
+    print("="*70 + "\n")
+    
     if args.wandb:
         print("intializing Weights and Biases...")
         wandb.init()
         config = wandb.config
         # Define your experiment name template (you can also hardcode it here or pass it via the config)
-        #name_template = "exp_bd{background_depth_iter}_dd{dynamics_depth_iter}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
-        name_template = "BASELINE_{video_number}_BD{background_depth_iter}_BRGB{background_RGB_iter}_DD{dynamics_depth_iter}_DRGB{dynamics_RGB_iter}_fine{fine_iter}" \
+        #name_template = "exp_bd{background_depth_iterations}_dd{dynamics_depth_iterations}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
+        name_template = "BASELINE_{video_number}_BD{background_depth_iterations}_BRGB{background_RGB_iterations}_DD{dynamics_depth_iterations}_DRGB{dynamics_RGB_iterations}_fine{fine_iterations}" \
                         "_startStaticLR{static_position_lr_init:.3f}_startDynamicLR{dynamic_position_lr_init:.3f}" \
                         "_pruneInterval{pruning_interval}_densifyInterval{densification_interval}"
 
         # Generate the experiment name using the hyperparameters from the sweep
         experiment_name = name_template.format(
             video_number = config.source_path.split('/')[-2],
-            background_depth_iter = config.background_depth_iter,
-            background_RGB_iter = config.background_RGB_iter,
-            dynamics_depth_iter = config.dynamics_depth_iter,
-            dynamics_RGB_iter = config.dynamics_RGB_iter,
-            fine_iter = config.fine_iter,
+            background_depth_iterations = config.background_depth_iterations,
+            background_RGB_iterations = config.background_RGB_iterations,
+            dynamics_depth_iterations = config.dynamics_depth_iterations,
+            dynamics_RGB_iterations = config.dynamics_RGB_iterations,
+            fine_iterations = config.fine_iterations,
             static_position_lr_init = config.static_position_lr_init,
             dynamic_position_lr_init = config.dynamic_position_lr_init,
             pruning_interval = config.pruning_interval,
@@ -880,29 +1127,47 @@ if __name__ == "__main__":
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    # Manual setting for sweeps
+    # ====================================================================
+    # Extract and apply all parameters
+    # ====================================================================
     op_params = op.extract(args)
-    op_params.background_depth_iterations =  args.background_depth_iter
-    op_params.background_RGB_iterations =  args.background_RGB_iter
-    op_params.dynamics_depth_iterations =  args.dynamics_depth_iter
-    op_params.dynamics_RGB_iterations =  args.dynamics_RGB_iter
-    op_params.fine_iterations =  args.fine_iter
-    op_params.batch_size =  args.bs
-    op_params.chamfer_weight = args.chamfer_weight
-    op_params.fine_opt_dyn_lr_downscaler = args.fine_opt_dyn_lr_downscaler
-    op_params.pruning_interval = args.pruning_interval
-    op_params.densification_interval = args.densification_interval
-    op_params.dynamic_position_lr_init = args.dynamic_position_lr_init
-    op_params.dynamic_position_lr_final = args.dynamic_position_lr_final
-    op_params.static_position_lr_init = args.static_position_lr_init
-    op_params.static_position_lr_final = args.static_position_lr_final
-
     hp_params = hp.extract(args)
+    
+    # Handle multires conversion if needed
     if type(hp_params.multires) == type(list()) and type(hp_params.multires[0]) == type(str()):
         hp_params.multires = [int(x) for x in hp_params.multires]
-    hp_params.net_width =  args.netork_width
     
-
+    # Apply all command-line overrides in one clean function
+    op_params, hp_params = apply_sweep_overrides(op_params, hp_params, args)
+    
+    # ====================================================================
+    # Print parameter summary for debugging
+    # ====================================================================
+    print("\n" + "="*70)
+    print("TRAINING CONFIGURATION")
+    print("="*70)
+    print(f"\n[Stage Iterations]")
+    print(f"  background_depth: {op_params.background_depth_iterations}")
+    print(f"  background_RGB: {op_params.background_RGB_iterations}")
+    print(f"  dynamics_depth: {op_params.dynamics_depth_iterations}")
+    print(f"  dynamics_RGB: {op_params.dynamics_RGB_iterations}")
+    print(f"  fine_coloring: {op_params.fine_iterations}")
+    
+    print(f"\n[Loss Weights (from hyper)]")
+    print(f"  general_depth_weight: {hp_params.general_depth_weight}")
+    print(f"  chamfer_weight: {hp_params.chamfer_weight}")
+    print(f"  normal_loss_weight: {hp_params.normal_loss_weight}")
+    print(f"  ssim_weight: {hp_params.ssim_weight}")
+    print(f"  plane_tv_weight: {hp_params.plane_tv_weight}")
+    
+    print(f"\n[Optimization Parameters]")
+    print(f"  batch_size: {op_params.batch_size}")
+    print(f"  pruning_interval: {op_params.pruning_interval}")
+    print(f"  densification_interval: {op_params.densification_interval}")
+    print(f"  static_position_lr: {op_params.static_position_lr_init} -> {op_params.static_position_lr_final}")
+    print(f"  dynamic_position_lr: {op_params.dynamic_position_lr_init} -> {op_params.dynamic_position_lr_final}")
+    print("="*70 + "\n")
+    
     dynamic_depth_training(lp.extract(args), hp_params, op_params, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.wandb)
 
     # All done

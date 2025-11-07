@@ -752,7 +752,8 @@ if __name__ == "__main__":
         import mmengine
         from utils.params_utils import merge_hparams
         config = mmengine.Config.fromfile(args.configs)
-        args = merge_hparams(args, config)
+        # Pass sys.argv so CLI args take priority over config
+        args = merge_hparams(args, config, cli_args=sys.argv)
     print("Optimizing " + args.model_path)
 
     if args.wandb:

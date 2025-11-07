@@ -47,7 +47,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", time = 0,
-                 mask = None, depth=None, depth_image=None, dynamic_mask = None
+                 mask = None, depth=None, depth_image=None, dynamic_mask = None, normal_map = None
                  ):
         super(Camera, self).__init__()
 
@@ -80,9 +80,13 @@ class Camera(nn.Module):
         self.depth = depth
         self.depth_image = depth_image
         self.dynamic_mask = dynamic_mask
+        self.normal_map = normal_map
         self.mask = mask
         self.zfar = 100.0
         self.znear = 0.01
+        
+        # Cache image gradient for gradient-aware losses (computed once)
+        self._image_gradient = None
 
         self.trans = trans
         self.scale = scale
@@ -94,6 +98,20 @@ class Camera(nn.Module):
         # .cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+    
+    def get_image_gradient(self):
+        """
+        Compute and cache the image gradient magnitude for gradient-aware losses.
+        This is computed once and reused across iterations.
+        
+        Returns:
+            grad_mag: (H, W) tensor of gradient magnitudes
+        """
+        if self._image_gradient is None:
+            from utils.dn_splatter_utils import compute_image_gradient
+            # Compute gradient from RGB image
+            self._image_gradient = compute_image_gradient(self.original_image)
+        return self._image_gradient
 
     def backproject_mask_to_world(self):
         """
@@ -135,6 +153,8 @@ class Camera(nn.Module):
             self.depth_image = self.depth_image.to(device)
         if self.dynamic_mask is not None:
             self.dynamic_mask = self.dynamic_mask.to(device)
+        if self.normal_map is not None:
+            self.normal_map = self.normal_map.to(device)
 
         # Move rotation and translation matrix
         #self.R = self.R.to(device)
