@@ -45,8 +45,33 @@ from time import time
 import copy
 import json
 import wandb
+import socket
+from datetime import datetime
 
 to8b = lambda x: (255 * np.clip(x.cpu().numpy(), 0, 1)).astype(np.uint8)
+
+def find_free_port(start_port=6000, max_attempts=100):
+    """Find an available port on localhost"""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('', port))
+            sock.close()
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(f"No free ports found in range {start_port}-{start_port+max_attempts}")
+
+def generate_unique_expname():
+    """Generate unique experiment name from W&B run or UUID"""
+    try:
+        if wandb.run is not None:
+            return wandb.run.name
+    except:
+        pass
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = str(uuid.uuid4())[:8]
+    return f"sweep_{timestamp}_{run_id}"
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -1145,31 +1170,18 @@ if __name__ == "__main__":
         print("intializing Weights and Biases...")
         wandb.init()
         config = wandb.config
-        # Define your experiment name template (you can also hardcode it here or pass it via the config)
-        #name_template = "exp_bd{background_depth_iterations}_dd{dynamics_depth_iterations}_defor{defor_depth}_width{net_width}_gridlr{grid_lr_init}"
-        name_template = "BASELINE_{video_number}_BD{background_depth_iterations}_BRGB{background_RGB_iterations}_DD{dynamics_depth_iterations}_DRGB{dynamics_RGB_iterations}_fine{fine_iterations}" \
-                        "_startStaticLR{static_position_lr_init:.3f}_startDynamicLR{dynamic_position_lr_init:.3f}" \
-                        "_pruneInterval{pruning_interval}_densifyInterval{densification_interval}"
-
+        
+        # Auto-assign port if set to 0
+        if args.port == 0:
+            args.port = find_free_port(6000)
+            print(f"✓ Auto-assigned port: {args.port}")
+        else:
+            print(f"✓ Using specified port: {args.port}")
+        
         # Generate the experiment name using the hyperparameters from the sweep
-        experiment_name = name_template.format(
-            video_number = config.source_path.split('/')[-2],
-            background_depth_iterations = config.background_depth_iterations,
-            background_RGB_iterations = config.background_RGB_iterations,
-            dynamics_depth_iterations = config.dynamics_depth_iterations,
-            dynamics_RGB_iterations = config.dynamics_RGB_iterations,
-            fine_iterations = config.fine_iterations,
-            static_position_lr_init = config.static_position_lr_init,
-            dynamic_position_lr_init = config.dynamic_position_lr_init,
-            pruning_interval = config.pruning_interval,
-            densification_interval = config.densification_interval,
-        )
-
-        # Optionally, update the run name in wandb
+        experiment_name = generate_unique_expname()
         wandb.run.name = experiment_name
-
         args.expname = experiment_name
-
         print("Experiment Name:", experiment_name)
 
     # Initialize system state (RNG)
