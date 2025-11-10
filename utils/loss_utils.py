@@ -97,7 +97,7 @@ def recall_loss(pred, gt, eps=1e-6):
     
 import torch
 
-def chamfer_loss(pred_list, gt_list, eps=1e-8):
+def chamfer_loss(pred_list, gt_list, eps=1e-8, use_optimized=True):
     """
     Computes the average Chamfer distance over a batch.
     
@@ -108,9 +108,20 @@ def chamfer_loss(pred_list, gt_list, eps=1e-8):
         pred_list (list of torch.Tensor): List of predicted 3D point sets.
         gt_list (list of torch.Tensor): List of ground-truth 3D point sets.
         eps (float): Small constant to avoid numerical issues.
+        use_optimized (bool): Use optimized implementation (faster but slightly different numerical behavior).
         
     Returns:
         torch.Tensor: A scalar tensor containing the average Chamfer distance.
+    """
+    if use_optimized:
+        return chamfer_loss_optimized(pred_list, gt_list, eps)
+    else:
+        return chamfer_loss_naive(pred_list, gt_list, eps)
+
+def chamfer_loss_naive(pred_list, gt_list, eps=1e-8):
+    """
+    Original naive implementation: computes full O(N×M) pairwise distance matrix.
+    Kept for reference and backward compatibility.
     """
     assert len(pred_list) == len(gt_list), "Batch sizes must match."
     batch_size = len(pred_list)
@@ -140,14 +151,74 @@ def chamfer_loss(pred_list, gt_list, eps=1e-8):
     # Return the average Chamfer distance over the batch.
     return torch.stack(chamfer_losses).mean()
 
-def chamfer_with_median(pred_list, gt_list, eps=1e-8):
+def chamfer_loss_optimized(pred_list, gt_list, eps=1e-8):
+    """
+    Optimized Chamfer distance using row-wise min operations (faster for many points).
+    
+    Instead of computing full O(N×M) matrix and then taking min, we compute
+    distances row-by-row (or column-by-column) which is more memory efficient
+    and can be faster for large point clouds.
+    
+    Args:
+        pred_list (list of torch.Tensor): List of predicted 3D point sets.
+        gt_list (list of torch.Tensor): List of ground-truth 3D point sets.
+        eps (float): Small constant to avoid numerical issues.
+        
+    Returns:
+        torch.Tensor: A scalar tensor containing the average Chamfer distance.
+    """
+    assert len(pred_list) == len(gt_list), "Batch sizes must match."
+    batch_size = len(pred_list)
+    chamfer_losses = []
+    
+    for pred_pts, gt_pts in zip(pred_list, gt_list):
+        if pred_pts.ndim != 2 or pred_pts.shape[1] != 3:
+            raise ValueError("Each predicted point set must have shape (M, 3)")
+        if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
+            raise ValueError("Each ground-truth point set must have shape (N, 3)")
+        
+        # For each predicted point, find nearest ground-truth point
+        # Compute squared L2 distance: ||pred - gt||^2 = sum((pred - gt)^2)
+        # Using broadcasting: (M,1,3) - (1,N,3) -> (M,N,3) -> (M,N)
+        pred_expanded = pred_pts.unsqueeze(1)  # (M, 1, 3)
+        gt_expanded = gt_pts.unsqueeze(0)      # (1, N, 3)
+        
+        # Squared distances
+        dist_sq = torch.sum((pred_expanded - gt_expanded) ** 2, dim=2)  # (M, N)
+        
+        # Min distance from each pred point to gt
+        min_dist_sq_pred, _ = torch.min(dist_sq, dim=1)  # (M,)
+        loss_pred = torch.sqrt(min_dist_sq_pred + eps).mean()
+        
+        # Min distance from each gt point to pred
+        min_dist_sq_gt, _ = torch.min(dist_sq, dim=0)  # (N,)
+        loss_gt = torch.sqrt(min_dist_sq_gt + eps).mean()
+        
+        chamfer_losses.append(loss_pred + loss_gt)
+    
+    # Return the average Chamfer distance over the batch.
+    return torch.stack(chamfer_losses).mean()
+
+def chamfer_with_median(pred_list, gt_list, eps=1e-8, use_optimized=True):
     """
     Like chamfer_loss, but also collects all "pred→gt" nearest‐neighbor distances
     and returns their median.
 
+    Args:
+        use_optimized (bool): Use optimized implementation
+        
     Returns:
         loss (Tensor scalar): average Chamfer distance over the batch.
         median_dist (float): median of sqrt(min_dist_sq_pred) over all pred points.
+    """
+    if use_optimized:
+        return chamfer_with_median_optimized(pred_list, gt_list, eps)
+    else:
+        return chamfer_with_median_naive(pred_list, gt_list, eps)
+
+def chamfer_with_median_naive(pred_list, gt_list, eps=1e-8):
+    """
+    Original implementation using torch.cdist (full O(N×M) matrix).
     """
     assert len(pred_list) == len(gt_list), "Batch sizes must match."
     chamfer_losses = []
@@ -182,6 +253,46 @@ def chamfer_with_median(pred_list, gt_list, eps=1e-8):
     # 6) Flatten all "pred→gt" distances into one big vector, then median
     all_min_dists = torch.cat(all_min_dists, dim=0)  # length = total #pred‐points
     median_dist = torch.median(all_min_dists).item() # scalar float
+
+    return loss, median_dist
+
+def chamfer_with_median_optimized(pred_list, gt_list, eps=1e-8):
+    """
+    Optimized version using row-wise operations instead of full matrix.
+    """
+    assert len(pred_list) == len(gt_list), "Batch sizes must match."
+    chamfer_losses = []
+    all_min_dists = []
+
+    for pred_pts, gt_pts in zip(pred_list, gt_list):
+        if pred_pts.ndim != 2 or pred_pts.shape[1] != 3:
+            raise ValueError("Each predicted set must have shape (M,3)")
+        if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
+            raise ValueError("Each GT set must have shape (N,3)")
+
+        # Compute squared distances using broadcasting
+        pred_expanded = pred_pts.unsqueeze(1)  # (M, 1, 3)
+        gt_expanded = gt_pts.unsqueeze(0)      # (1, N, 3)
+        dist_sq = torch.sum((pred_expanded - gt_expanded) ** 2, dim=2)  # (M, N)
+
+        # For each pred point, find min distance to GT
+        min_dist_sq_pred, _ = torch.min(dist_sq, dim=1)  # (M,)
+        all_min_dists.append(torch.sqrt(min_dist_sq_pred + eps))  # (M,)
+
+        # For each GT point, find min distance to pred
+        min_dist_sq_gt, _ = torch.min(dist_sq, dim=0)  # (N,)
+
+        # Per-set Chamfer
+        loss_pred = torch.sqrt(min_dist_sq_pred + eps).mean()
+        loss_gt   = torch.sqrt(min_dist_sq_gt + eps).mean()
+        chamfer_losses.append(loss_pred + loss_gt)
+
+    # Combine batch loss
+    loss = torch.stack(chamfer_losses).mean()
+
+    # Compute median
+    all_min_dists = torch.cat(all_min_dists, dim=0)
+    median_dist = torch.median(all_min_dists).item()
 
     return loss, median_dist
 

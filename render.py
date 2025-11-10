@@ -224,8 +224,11 @@ def render_set_no_compression(
     gts_path = os.path.join(run_dir, "gt")
     depth_render_path = os.path.join(run_dir, "depth_renders")
     depth_render_tensors_path = os.path.join(run_dir, "depth_renders_tensors")
+    normal_render_path = os.path.join(run_dir, "normal_renders")
+    normal_render_tensors_path = os.path.join(run_dir, "normal_renders_tensors")
 
-    for d in [render_path, gts_path, depth_render_path, depth_render_tensors_path]:
+    for d in [render_path, gts_path, depth_render_path, depth_render_tensors_path, 
+              normal_render_path, normal_render_tensors_path]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
     print("point nums:", gaussians._xyz.shape[0])
@@ -248,6 +251,7 @@ def render_set_no_compression(
     # collections
     rgb_render_list, rgb_gt_list, names = [], [], []
     depth_render_vis_list, depth_render_tensor_list = [], []
+    normal_render_vis_list, normal_render_tensor_list = [], []
     W = H = None
     first, t0 = True, 0.0
 
@@ -255,12 +259,25 @@ def render_set_no_compression(
         if first:
             first, t0 = False, time()
 
-        pkg = render_func(
-            view, gaussians, pipeline, background,
-            cam_type=cam_type,
-            override_color=override_color,
-            override_opacity=override_opacity
-        )
+        # Render with normal map generation enabled
+        # Try to pass render_normals flag (only works with render_with_dynamic_gaussians_mask)
+        try:
+            pkg = render_func(
+                view, gaussians, pipeline, background,
+                cam_type=cam_type,
+                override_color=override_color,
+                override_opacity=override_opacity,
+                render_normals=True  # NEW: Request normal map rendering
+            )
+        except TypeError:
+            # Fallback for render functions that don't support render_normals flag
+            pkg = render_func(
+                view, gaussians, pipeline, background,
+                cam_type=cam_type,
+                override_color=override_color,
+                override_opacity=override_opacity
+            )
+            
         rendering = pkg["render"].detach()   # [3,H,W]
         depth     = pkg["depth"].detach()    # [1,H,W] or [H,W]
 
@@ -280,6 +297,20 @@ def render_set_no_compression(
             depth_vis = d_vis.unsqueeze(0).repeat(3, 1, 1)
             depth_tensor = d.cpu()
 
+        # Extract rendered normal map if available
+        normal_vis = None
+        normals = None
+        if pkg.get("normal_map") is not None:
+            normals = pkg["normal_map"].detach()  # [3, H, W] in range [-1, 1]
+            # Visualize normals as RGB (same as GT visualization)
+            # Map normal components [-1, 1] → RGB [0, 255]
+            # This gives Red=+X, Green=+Y, Blue=+Z direction
+            normal_vis = (normals.cpu() + 1.0) / 2.0  # [0, 1] range for visualization
+            if aria:
+                normal_vis = normal_vis.permute(1, 2, 0)
+                normal_vis = torch.rot90(normal_vis, k=3, dims=(0, 1))
+                normal_vis = normal_vis.permute(2, 0, 1)
+
         if W is None or H is None:
             H, W = rendering.shape[-2], rendering.shape[-1]
 
@@ -287,6 +318,11 @@ def render_set_no_compression(
         rgb_render_list.append(rendering.half().cpu())
         depth_render_vis_list.append(depth_vis.half())
         depth_render_tensor_list.append(depth_tensor)
+        
+        # Collect normal maps
+        if normal_vis is not None:
+            normal_render_vis_list.append(normal_vis.half().cpu())
+            normal_render_tensor_list.append(normals.half().cpu())
 
         # RGB GT
         if cam_type != "PanopticSports":
@@ -311,6 +347,11 @@ def render_set_no_compression(
     _write_png_named(rgb_gt_list, names, gts_path)
     _write_png_named(depth_render_vis_list, names, depth_render_path)
     _save_tensors_named(depth_render_tensor_list, names, depth_render_tensors_path)
+    
+    # Write normal maps if available
+    if len(normal_render_vis_list) > 0:
+        _write_png_named(normal_render_vis_list, names, normal_render_path)
+        _save_tensors_named(normal_render_tensor_list, names, normal_render_tensors_path)
 
     # manifest (unchanged shape)
     manifest = {
@@ -347,6 +388,15 @@ def render_set_no_compression(
         imageio.mimwrite(os.path.join(run_dir, 'video_rgb.mp4'), imgs, fps=15)
         dimgs = [imageio.imread(os.path.join(depth_render_path, f"{n}.png")) for n in sorted_names]
         imageio.mimwrite(os.path.join(run_dir, 'video_depth.mp4'), dimgs, fps=15)
+        
+        # Create normal maps video if normal renders were generated
+        if len(normal_render_vis_list) > 0:
+            try:
+                nimgs = [imageio.imread(os.path.join(normal_render_path, f"{n}.png")) for n in sorted_names]
+                imageio.mimwrite(os.path.join(run_dir, 'video_normals.mp4'), nimgs, fps=15)
+                print(f"✓ Created video_normals.mp4")
+            except Exception as e:
+                print(f"[WARN] Failed to create normal maps video: {e}")
 
 
 def render_all_splits(

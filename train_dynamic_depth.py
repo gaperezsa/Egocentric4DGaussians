@@ -18,7 +18,10 @@ from random import randint
 from utils.exocentric_utils import compute_exocentric_from_file
 from utils.graphics_utils import getWorld2View2
 from utils.loss_utils import l1_loss, l1_filtered_loss, chamfer_loss, chamfer_with_median, l1_background_colored_masked_loss, gradient_aware_depth_loss, ssim
-from utils.dn_splatter_utils import normal_regularization_loss, render_normal_map_from_gaussians, scale_regularization_loss
+from utils.dn_splatter_utils import (
+    normal_regularization_loss,
+    scale_regularization_loss
+)
 from gaussian_renderer import render, network_gui, render_with_dynamic_gaussians_mask, render_dynamic_gaussians_mask_and_compare, get_deformed_gaussian_centers
 from render import render_set_no_compression, render_all_splits
 from metrics import evaluate_single_folder
@@ -74,7 +77,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
     rendering_only_background_or_only_dynamic = stage != "fine_coloring"
     depth_only_stage = stage in ("background_depth", "dynamics_depth")
-    hyper.general_depth_weight = 1e-5 # temporary weight
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -89,6 +91,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
     final_iter = train_iter
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
+    
+    # Cache for per-camera ground truth point clouds (dynamics_depth optimization)
+    gt_pointcloud_cache = {}
 
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
@@ -102,7 +107,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
     batch_size = opt.batch_size
     print("data loading done")
-
+    
     # DataLoader branch
     if opt.dataloader:
         viewpoint_stack = scene.getTrainCameras()
@@ -213,15 +218,29 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             # Special case: dynamics_depth stage only needs point clouds
             if stage == "dynamics_depth":
                 dynamic_point_cloud.append(get_deformed_gaussian_centers(viewpoint_cam, gaussians))
-                gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
+                
+                # Use cached backprojected point cloud (computed once per camera)
+                cam_id = viewpoint_cam.uid
+                if cam_id not in gt_pointcloud_cache:
+                    gt_pointcloud_cache[cam_id] = viewpoint_cam.backproject_mask_to_world().squeeze().cuda()
+                gt_dynamic_point_cloud.append(gt_pointcloud_cache[cam_id])
                 continue
-            
+           
             # Render RGB and depth for this viewpoint
+            # Determine if we need to render normals for this stage
+            should_render_normals = (
+                stage in ("background_depth", "background_RGB", "fine_coloring") and
+                hyper.normal_loss_weight > 0 and
+                viewpoint_cam.normal_map is not None
+            )
+           
             pkg = render_with_dynamic_gaussians_mask(
                 viewpoint_cam, gaussians, pipe, background,
                 stage=stage, cam_type=scene.dataset_type,
-                training=rendering_only_background_or_only_dynamic
+                training=rendering_only_background_or_only_dynamic,
+                render_normals=should_render_normals  # NEW: flag-based normal rendering
             )
+            
             image, depth_image = pkg["render"], pkg["depth"]
             viewspace_point_tensor, visibility_filter, radii = pkg["viewspace_points"], pkg["visibility_filter"], pkg["radii"]
 
@@ -241,23 +260,25 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             depth_images.append(depth_image.squeeze().unsqueeze(0))
             gt_depth_images.append(viewpoint_cam.depth_image.unsqueeze(0))
             
-            # Collect ground truth normal maps (only if available)
+            # Collect ground truth and rendered normal maps (if available)
             if viewpoint_cam.normal_map is not None:
                 gt_normal_maps.append(viewpoint_cam.normal_map.unsqueeze(0))
                 
-                # Render normal map from Gaussians (only for normal loss stages)
-                if stage in ("background_depth", "background_RGB", "fine_coloring") and hyper.normal_loss_weight > 0:
-                    rendered_normals, _, _ = render_normal_map_from_gaussians(
-                        gaussians, viewpoint_cam, pipe, background, stage=stage, cam_type=scene.dataset_type
-                    )
-                    rendered_normal_maps.append(rendered_normals.unsqueeze(0))
+                # Get rendered normals from render package (computed if should_render_normals was True)
+                if pkg["normal_map"] is not None:
+                    rendered_normal_maps.append(pkg["normal_map"].unsqueeze(0))
 
             # Collect dynamic-specific renders (only for dynamics stages)
             if pkg.get("dynamic_only_render") is not None:
                 dynamic_image.append(pkg["dynamic_only_render"].unsqueeze(0))
                 dynamic_depth.append(pkg["dynamic_only_depth"].squeeze().unsqueeze(0))
                 dynamic_point_cloud.append(pkg["dynamic_3D_means"].squeeze().cuda())
-                gt_dynamic_point_cloud.append(viewpoint_cam.backproject_mask_to_world().squeeze().cuda())
+                
+                # Use cached backprojected point cloud (computed once per camera)
+                cam_id = viewpoint_cam.uid
+                if cam_id not in gt_pointcloud_cache:
+                    gt_pointcloud_cache[cam_id] = viewpoint_cam.backproject_mask_to_world().squeeze().cuda()
+                gt_dynamic_point_cloud.append(gt_pointcloud_cache[cam_id])
 
             # Collect densification stats
             radii_list.append(radii.unsqueeze(0))
@@ -276,6 +297,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         scale_loss = torch.tensor(0.0, device="cuda")
         ssim_loss_val = torch.tensor(0.0, device="cuda")
         local_tv_loss = torch.tensor(0.0, device="cuda")
+        median_dist = None  # Only computed in dynamics_RGB (for densification)
 
         # Concatenate common tensors (except for dynamics_depth stage)
         if stage != "dynamics_depth":
@@ -306,8 +328,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 )
             else:
                 # Standard L1 depth loss
-                reduction = "mean" if iteration < opt.densify_from_iter else "sum"
-                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, mask, reduction=reduction)
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, mask, reduction="mean")
             
             # Normal loss: static regions only
             if len(rendered_normal_maps) > 0 and len(gt_normal_maps) > 0:
@@ -355,7 +376,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     image_gradient=image_gradient_tensor, mask=depth_mask
                 )
             else:
-                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, depth_mask, reduction="sum")
+                depth_loss = l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, depth_mask, reduction="mean")
             
             # Normal loss: static regions only
             if len(rendered_normal_maps) > 0 and len(gt_normal_maps) > 0:
@@ -478,42 +499,68 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         # ====================================================================
         # STEP 4: Combine all losses with weights
         # ====================================================================
-        loss = Ll1 \
+
+        loss = hyper.rgb_weight * Ll1 \
              + hyper.general_depth_weight * depth_loss \
              + hyper.chamfer_weight * dynamic_mask_loss \
              + hyper.normal_loss_weight * normal_loss \
-             + scale_loss \
+             + hyper.scale_loss_weight * scale_loss \
              + hyper.ssim_weight * ssim_loss_val \
              + hyper.plane_tv_weight * local_tv_loss
 
         # ====================================================================
         # Log loss magnitudes and weighted contributions (every N iterations)
+        # COMPREHENSIVE DEBUG: Show all losses for all stages (even if zero)
         # ====================================================================
         if iteration % 100 == 0:
             # Compute weighted contributions
+            weighted_rgb = hyper.rgb_weight * Ll1.item()
             weighted_depth = hyper.general_depth_weight * depth_loss.item()
             weighted_chamfer = hyper.chamfer_weight * dynamic_mask_loss.item()
             weighted_normal = hyper.normal_loss_weight * normal_loss.item()
+            weighted_scale = hyper.scale_loss_weight * scale_loss.item()
             weighted_ssim = hyper.ssim_weight * ssim_loss_val.item()
             weighted_tv = hyper.plane_tv_weight * local_tv_loss.item()
             
-            print(f"\n[ITER {iteration:5d} | Stage: {stage:16s}]")
-            print(f"  RGB Loss:          {Ll1.item():.6f}")
-            if depth_loss.item() > 0:
-                print(f"  Depth Loss:        {depth_loss.item():.6f} × {hyper.general_depth_weight:.6f} = {weighted_depth:.6f}")
-            if dynamic_mask_loss.item() > 0:
-                print(f"  Chamfer Loss:      {dynamic_mask_loss.item():.6f} × {hyper.chamfer_weight:.6f} = {weighted_chamfer:.6f}")
-            if normal_loss.item() > 0:
-                print(f"  Normal Loss:       {normal_loss.item():.6f} × {hyper.normal_loss_weight:.6f} = {weighted_normal:.6f}")
-            if scale_loss.item() > 0:
-                print(f"  Scale Loss:        {scale_loss.item():.6f} (no external weight)")
-            if ssim_loss_val.item() > 0:
-                print(f"  SSIM Loss:         {ssim_loss_val.item():.6f} × {hyper.ssim_weight:.6f} = {weighted_ssim:.6f}")
-            if local_tv_loss.item() > 0:
-                print(f"  Spacetime TV:      {local_tv_loss.item():.6f} × {hyper.plane_tv_weight:.6f} = {weighted_tv:.6f}")
-            print(f"  {'='*50}")
-            print(f"  TOTAL LOSS:        {loss.item():.6f}")
-            print(f"  {'='*50}")
+            # Track which losses were actually computed (not just zero)
+            depth_computed = (stage in ("background_depth", "background_RGB", "dynamics_RGB", "fine_coloring"))
+            chamfer_computed = (stage in ("dynamics_depth", "dynamics_RGB"))
+            normal_computed = (stage in ("background_depth", "background_RGB", "fine_coloring") and 
+                              len(gt_normal_maps) > 0 and len(rendered_normal_maps) > 0)
+            scale_computed = (stage in ("background_depth", "background_RGB", "fine_coloring") and 
+                            hyper.normal_loss_weight > 0)
+            ssim_computed = (stage == "fine_coloring" and hyper.ssim_weight != 0)
+            tv_computed = (stage in ("dynamics_RGB", "fine_coloring") and hyper.plane_tv_weight > 0)
+            rgb_computed = (stage in ("background_RGB", "dynamics_RGB", "fine_coloring"))
+            
+            # Stage-specific sanity checks
+            stage_info = {
+                "background_depth": "Static depth only (RGB=0, Chamfer=0, SSIM=0)",
+                "background_RGB": "Static RGB+depth only (Chamfer=0, SSIM=optional)",
+                "dynamics_depth": "Dynamic point clouds only (RGB=0, Depth=optional, Normal=0, SSIM=0)",
+                "dynamics_RGB": "Dynamic RGB+depth (Normal=optional)",
+                "fine_coloring": "Full image refinement (all losses active)"
+            }
+            
+            print(f"\n{'='*70}")
+            print(f"[ITER {iteration:5d} | Stage: {stage:16s}] {stage_info.get(stage, '')}")
+            print(f"{'='*70}")
+            
+            def format_loss_line(name, value, weight, weighted, computed, width_val=12):
+                status = '✓' if (computed and value > 0) else ('✓ (zero)' if computed else '✗ NOT COMPUTED')
+                return f"  {name:18s} {value:{width_val}.6f} (weight: {weight:6.4f}) → {weighted:{width_val}.6f}  {status}"
+            
+            print(format_loss_line("RGB Loss:", Ll1.item(), hyper.rgb_weight, weighted_rgb, rgb_computed))
+            print(format_loss_line("Depth Loss:", depth_loss.item(), hyper.general_depth_weight, weighted_depth, depth_computed))
+            print(format_loss_line("Chamfer Loss:", dynamic_mask_loss.item(), hyper.chamfer_weight, weighted_chamfer, chamfer_computed))
+            print(format_loss_line("Normal Loss:", normal_loss.item(), hyper.normal_loss_weight, weighted_normal, normal_computed))
+            print(format_loss_line("Scale Loss:", scale_loss.item(), hyper.scale_loss_weight, weighted_scale, scale_computed))
+            print(format_loss_line("SSIM Loss:", ssim_loss_val.item(), hyper.ssim_weight, weighted_ssim, ssim_computed))
+            print(format_loss_line("Spacetime TV:", local_tv_loss.item(), hyper.plane_tv_weight, weighted_tv, tv_computed))
+            
+            print(f"  {'-'*70}")
+            print(f"  TOTAL LOSS:        {loss.item():12.6f}")
+            print(f"{'='*70}")
 
         # ====================================================================
         # STEP 5: Compute PSNR (only for RGB stages)
@@ -585,12 +632,8 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                             # breakpoint()
                             render_training_image(scene, gaussians, [test_cams[0%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
                             #render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                            if stage == "dynamics_depth":
-                                render_base_path = os.path.join(scene.model_path, f"{stage}_render")
-                                image_path = os.path.join(render_base_path,"images")
-                                render_pkg = render_with_dynamic_gaussians_mask(train_cams[0%len(train_cams)], gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, training=True)
-                                torchvision.utils.save_image((render_pkg["dynamic_only_depth"] > 0).detach().cpu().float(), render_base_path+f"_dyn_splat_{iteration}.png")
-
+                            # Removed dyn_splat PNG output to save time and disk space
+                            
                             # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
 
                         # total_images.append(to8b(temp_image).transpose(1,2,0))
@@ -744,6 +787,8 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
     if  current_stage == stages[2]:
         # Initialize dynamic gaussians in the model
         gaussians.spawn_dynamic_gaussians(random_init = False, precomputed_positions = list(scene.getTrainCameras())[10].backproject_mask_to_world())
+        print("\n[OPTIMIZATION] Per-camera point cloud caching enabled for dynamics_depth stage")
+        print("               Backprojection computed once per camera, cached in RAM (~108 MB)")
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "dynamics_depth", tb_writer, using_wandb, training_iters[2], timer, first_iters[2])
@@ -1064,29 +1109,36 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
 
     # ====================================================================
-    # LOG PARAMETER FLOW - Show where each parameter came from
+    # ====================================================================
+    # LOG TRAINING CONFIGURATION
     # ====================================================================
     print("\n" + "="*70)
-    print("PARAMETER FLOW VERIFICATION")
+    print("TRAINING CONFIGURATION")
     print("="*70)
-    print("\n[Config File Source] (arguments/HOI4D/default.py):")
-    print(f"  batch_size: 2 (config default)")
-    print(f"  background_depth_iterations: 500 (config default)")
-    print(f"  pruning_interval: 700 (config default)")
-    print(f"  chamfer_weight: 50.0 (config default)")
-    print(f"  general_depth_weight: 0.01 (config default)")
     
-    print("\n[CLI Arguments] (what bash script passed):")
-    print(f"  See: {' '.join(sys.argv[1:])}")
+    print("\n[Stage Iterations]")
+    print(f"  background_depth: {args.background_depth_iterations}")
+    print(f"  background_RGB: {args.background_RGB_iterations}")
+    print(f"  dynamics_depth: {args.dynamics_depth_iterations}")
+    print(f"  dynamics_RGB: {args.dynamics_RGB_iterations}")
+    print(f"  fine_coloring: {args.fine_iterations}")
     
-    print("\n[Final Values After Merge] (CLI > Config > Code defaults):")
-    print(f"  batch_size: {args.batch_size}")
-    print(f"  background_depth_iterations: {args.background_depth_iterations}")
-    print(f"  pruning_interval: {args.pruning_interval}")
-    print(f"  chamfer_weight: {args.chamfer_weight}")
+    print("\n[Loss Weights (from hyper)]")
+    print(f"  rgb_weight: {args.rgb_weight}")
     print(f"  general_depth_weight: {args.general_depth_weight}")
-    print(f"  densification_interval: {args.densification_interval}")
+    print(f"  chamfer_weight: {args.chamfer_weight}")
+    print(f"  normal_loss_weight: {args.normal_loss_weight}")
+    print(f"  scale_loss_weight: {args.scale_loss_weight}")
+    print(f"  ssim_weight: {args.ssim_weight}")
+    print(f"  scale_loss_weight: {args.scale_loss_weight}")
     print(f"  plane_tv_weight: {args.plane_tv_weight}")
+    
+    print("\n[Optimization Parameters]")
+    print(f"  batch_size: {args.batch_size}")
+    print(f"  pruning_interval: {args.pruning_interval}")
+    print(f"  densification_interval: {args.densification_interval}")
+    print(f"  static_position_lr: {args.static_position_lr_init:.0e} -> {args.static_position_lr_final:.0e}")
+    print(f"  dynamic_position_lr: {args.dynamic_position_lr_init:.0e} -> {args.dynamic_position_lr_final:.0e}")
     print("="*70 + "\n")
     
     if args.wandb:
@@ -1154,10 +1206,13 @@ if __name__ == "__main__":
     print(f"  fine_coloring: {op_params.fine_iterations}")
     
     print(f"\n[Loss Weights (from hyper)]")
+    print(f"  rgb_weight: {hp_params.rgb_weight}")
     print(f"  general_depth_weight: {hp_params.general_depth_weight}")
     print(f"  chamfer_weight: {hp_params.chamfer_weight}")
     print(f"  normal_loss_weight: {hp_params.normal_loss_weight}")
+    print(f"  scale_loss_weight: {hp_params.scale_loss_weight}")
     print(f"  ssim_weight: {hp_params.ssim_weight}")
+    print(f"  scale_loss_weight: {hp_params.scale_loss_weight}")
     print(f"  plane_tv_weight: {hp_params.plane_tv_weight}")
     
     print(f"\n[Optimization Parameters]")

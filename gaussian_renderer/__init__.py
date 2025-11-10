@@ -336,7 +336,7 @@ def render_dynamic_compare(viewpoint_camera, pc : GaussianModel, pipe, bg_color 
     return per_gaussian_valid_dynamic_movement
 
 
-def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_opacity = None, stage = "fine", cam_type = None, training = False):
+def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_opacity = None, stage = "fine", cam_type = None, training = False, render_normals = False):
     """
     Render the scene. 
     
@@ -556,7 +556,82 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-       
+    
+    # ============================================================================
+    # Render normals if requested (use gsplat if available, fallback to PyTorch)
+    # ============================================================================
+    normal_map = None
+    if render_normals:
+        from time import time as get_time
+        from utils.dn_splatter_utils import compute_gaussian_normals, render_normals
+        
+        t_normal_start = get_time()
+        
+        # Compute per-Gaussian normals from geometry
+        normals_world = compute_gaussian_normals(
+            quaternions=rotations_final,
+            scales=scales_final,
+            means3D=means3D_final,
+            camera_center=viewpoint_camera.camera_center.cuda(),
+            flip_to_camera=True
+        )
+        
+        # Transform normals to camera space
+        # NOTE: Normals are treated as passive "colors" by gsplat, not geometric entities
+        # Therefore we must transform them to camera space ourselves
+        R_w2c = viewpoint_camera.world_view_transform[:3, :3].cuda()
+        normals_cam = (R_w2c @ normals_world.T).T  # [N, 3]
+        normals_cam = torch.nn.functional.normalize(normals_cam, p=2, dim=-1)
+        
+        H = int(viewpoint_camera.image_height)
+        W = int(viewpoint_camera.image_width)
+        
+        # gsplat viewmat expects world-to-cam transformation (COLMAP convention)
+        # Our cameras store world_view_transform as TRANSPOSED, so transpose it back
+        viewmat = viewpoint_camera.world_view_transform.T.cuda()  # [4, 4]
+        
+        # Construct intrinsic matrix K from FoV
+        # K = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+        # fx = W / (2 * tan(FoVx/2))
+        # fy = H / (2 * tan(FoVy/2))
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+        fx = W / (2.0 * tanfovx)
+        fy = H / (2.0 * tanfovy)
+        cx = W / 2.0
+        cy = H / 2.0
+        
+        K = torch.tensor([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=torch.float32, device="cuda")
+        
+        # Ensure opacities is 1D
+        opacities_1d = opacity_final.squeeze(-1) if opacity_final.ndim > 1 else opacity_final
+        
+        # Compute depths for PyTorch fallback (if needed)
+        cam_pos = viewpoint_camera.world_view_transform[3, :3].cuda()
+        depths_for_fallback = torch.norm(means3D_final - cam_pos.unsqueeze(0), dim=-1)
+        
+        # Call unified render_normals (decides gsplat vs PyTorch internally)
+        t_render_start = get_time()
+        normal_map = render_normals(
+            means3D=means3D_final,
+            quats=rotations_final,
+            scales=scales_final,
+            opacities=opacities_1d,
+            normals_cam=normals_cam,
+            viewmat=viewmat,
+            K=K,
+            H=H,
+            W=W,
+            # PyTorch fallback parameters (only used if gsplat unavailable)
+            means2D=screenspace_points,
+            depths=depths_for_fallback,
+            radii=radii
+        )
+
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
@@ -568,7 +643,8 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
             "dynamic_only_render": dynamic_only_splat,
             "dynamic_only_radii": dynamic_only_radii,
             "dynamic_only_depth": dynamic_only_depth,
-            "dynamic_3D_means": means3D_final[dynamic_gaussians_mask]
+            "dynamic_3D_means": means3D_final[dynamic_gaussians_mask],
+            "normal_map": normal_map  # NEW: Rendered normal map [3, H, W] or None
             }
 
 

@@ -10,8 +10,10 @@ ModelHiddenParams = dict(
     net_width = 128,
     # ========== Loss Weights (DN-Splatter & Depth) ==========
     general_depth_weight = 0.01,           # Depth supervision (all depth stages)
+    rgb_weight = 10.0,                      # RGB supervision weight
     chamfer_weight = 50.0,                 # Chamfer distance (dynamic objects)
     normal_loss_weight = 0.05,             # Normal regularization (geometric)
+    scale_loss_weight = 1.0,               # Scale regularization (disk like encouraging)
     ssim_weight = 0.1,                     # SSIM loss (fine_coloring)
     plane_tv_weight = 0.0001,              # Space-time TV regularization
     # ========== Other Hyperparameters ==========
@@ -30,8 +32,8 @@ OptimizationParams = dict(
     
     # ========== Learning Rates - Position ==========
     batch_size = 2,
-    dynamic_position_lr_init = 1e-15,
-    dynamic_position_lr_final = 1e-16,
+    dynamic_position_lr_init = 1e-16,
+    dynamic_position_lr_final = 1e-17,
     static_position_lr_init = 1e-14,
     static_position_lr_final = 1e-15,
     

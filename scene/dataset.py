@@ -32,6 +32,7 @@ class FourDGSdataset(Dataset):
                 image = caminfo.image
                 depth_image = caminfo.depth_image
                 dynamic_mask = caminfo.dynamic_mask
+                normal_map = getattr(caminfo, 'normal_map', None)
                 
                 R = caminfo.R
                 T = caminfo.T
@@ -45,7 +46,7 @@ class FourDGSdataset(Dataset):
             
             return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image,gt_alpha_mask=None,
                         image_name=orig_name,uid=index,data_device=torch.device("cuda"),time=time,
-                        mask=mask, depth_image=depth_image, dynamic_mask=dynamic_mask)
+                        mask=mask, depth_image=depth_image, dynamic_mask=dynamic_mask, normal_map=normal_map)
         else:
             return self.dataset[index]
     def __len__(self):

@@ -104,10 +104,12 @@ class ModelHiddenParams(ParamGroup):
         self.apply_rotation=False
         
         # DN-Splatter & Depth Loss Weights (all hyperparameters unified here)
-        self.use_gradient_aware_depth = True  # Use gradient-aware depth loss instead of standard L1
+        self.use_gradient_aware_depth = False  # Use gradient-aware depth loss instead of standard L1
         self.general_depth_weight = 0.01  # Weight for depth supervision (all depth stages)
+        self.rgb_weight = 1.0  # Weight for RGB supervision
         self.chamfer_weight = 50.0  # Weight for Chamfer distance loss (dynamic objects point cloud)
         self.normal_loss_weight = 0.05  # Weight for normal regularization loss (geometric consistency)
+        self.scale_loss_weight = 1.0  # Weight for scale regularization loss (disk like encouraging)
         self.normal_l1_weight = 1.0  # Weight for normal L1 term within normal loss
         self.normal_tv_weight = 0.01  # Weight for normal TV smoothness term
         self.ssim_weight = 0.0  # Weight for SSIM loss (fine_coloring stage, 0 = disabled)

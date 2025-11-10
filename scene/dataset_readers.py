@@ -138,6 +138,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         dynamic_masks_path = image_path.split("colmap")[0] + "dynamic_masks/" + image_name.replace("camera_rgb","camera_dynamics") + ".npy"
         normal_path = image_path.split("colmap")[0] + "normals/" + image_name.replace("camera_rgb","camera_normal") + ".npy"
 
+        # Debug: Print paths for first camera
+        if idx == 0:
+            print(f"\n[DEBUG] Camera 0 paths:")
+            print(f"  Image: {image_path}")
+            print(f"  Depth: {depth_path} (exists: {os.path.isfile(depth_path)})")
+            print(f"  Mask: {dynamic_masks_path} (exists: {os.path.isfile(dynamic_masks_path)})")
+            print(f"  Normal: {normal_path} (exists: {os.path.isfile(normal_path)})")
+
         depth_image = None
         if os.path.isfile(depth_path):
             depth_image = Image.open(depth_path)
@@ -151,6 +159,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
         if os.path.isfile(normal_path):
             normal_np = np.load(normal_path).astype(np.float32)  # (H, W, 3) in range [-1, 1]
             normal_map = torch.from_numpy(normal_np).permute(2, 0, 1)  # Convert to (3, H, W)
+            if idx == 0:
+                print(f"  [LOADED normal_map] shape: {normal_map.shape}, dtype: {normal_map.dtype}, range: [{normal_map.min():.3f}, {normal_map.max():.3f}]")
             
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                                 image_path=image_path, image_name=image_name, depth_image=depth_image, depth_path=depth_path, 
@@ -159,6 +169,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_folde
             
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
+    
+    # Summary of loaded data
+    num_with_depth = sum(1 for c in cam_infos if c.depth_image is not None)
+    num_with_mask = sum(1 for c in cam_infos if c.dynamic_mask is not None)
+    num_with_normals = sum(1 for c in cam_infos if c.normal_map is not None)
+    print(f"[LOADED] {len(cam_infos)} cameras:")
+    print(f"  - Depth maps: {num_with_depth}/{len(cam_infos)}")
+    print(f"  - Dynamic masks: {num_with_mask}/{len(cam_infos)}")
+    print(f"  - Normal maps: {num_with_normals}/{len(cam_infos)}")
+    
     return cam_infos
 
 def fetchPly(path):
