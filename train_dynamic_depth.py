@@ -798,14 +798,14 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "background_depth", tb_writer, using_wandb, training_iters[0], timer, first_iters[0])
-        render_set_no_compression(dataset.model_path, "background_depth_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
+        render_set_no_compression(dataset.model_path, "background_depth_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
         current_stage = stages[1]
     
     if  current_stage == stages[1]: 
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "background_RGB", tb_writer, using_wandb, training_iters[1], timer, first_iters[1])
-        render_set_no_compression(dataset.model_path, "background_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
+        render_set_no_compression(dataset.model_path, "background_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
         current_stage = stages[2]
 
     
@@ -817,14 +817,14 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "dynamics_depth", tb_writer, using_wandb, training_iters[2], timer, first_iters[2])
-        render_set_no_compression(dataset.model_path, "dynamics_depth_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
+        render_set_no_compression(dataset.model_path, "dynamics_depth_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
         current_stage = stages[3]
 
     if  current_stage == stages[3]:
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "dynamics_RGB", tb_writer, using_wandb, training_iters[3], timer, first_iters[3])
-        render_set_no_compression(dataset.model_path, "dynamics_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
+        render_set_no_compression(dataset.model_path, "dynamics_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
         current_stage = stages[4]
 
     # No fine stage, just end the experiment
@@ -1048,7 +1048,7 @@ def training_report(tb_writer, using_wandb, iteration, Ll1, loss, l1_loss, psnr_
                 if using_wandb:
                     wandb.log({f"{stage}/{config['name']}/loss_viewpoint - l1_loss": l1_test})
                     wandb.log({f"{stage}/{config['name']}/loss_viewpoint - psnr": psnr_test})
-                    if stage in ("background_RGB", "dynamics_RGB") and psnr_test < 17:
+                    if stage in ("background_RGB", "dynamics_RGB") and psnr_test < 15:
                         print(f"tested in iteration {iteration} on stage {stage} and got a PSNR of {psnr_test}, stopping early in order to start next run ")
                         sys.exit(0)
 
@@ -1098,10 +1098,10 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 999, 4999, 7999, 9999])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 999, 4999, 7999, 9999, 13900, 19999, 29999])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 1999, 4999, 7999, 9999])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 1999, 4999, 7999, 9999, 13900, 19999, 29999])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[ 999, 4999, 7999, 9999, 13900, 19999, 29999])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[ 1999, 4999, 7999, 9999, 13900, 19999, 29999])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
