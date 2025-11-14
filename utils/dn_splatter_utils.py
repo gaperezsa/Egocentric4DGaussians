@@ -436,7 +436,8 @@ def normal_regularization_loss(
 
 def scale_regularization_loss(
     get_scaling_fn,
-    lambda_scale: float = 0.01
+    lambda_scale: float = 0.01,
+    debug: bool = False
 ) -> torch.Tensor:
     """
     Regularize Gaussian scales to be more disc-like (thin in one direction).
@@ -447,6 +448,7 @@ def scale_regularization_loss(
     Args:
         get_scaling_fn: Either a callable that returns scales [N, 3] or a tensor [N, 3]
         lambda_scale: Weight for scale regularization (default: 0.01)
+        debug: If True, print debug info about number of Gaussians processed
     
     Returns:
         loss: Scale regularization loss (scalar)
@@ -457,6 +459,8 @@ def scale_regularization_loss(
     else:
         scales = get_scaling_fn  # [N, 3]
     
+    num_gaussians = scales.shape[0]
+    
     # Compute ratio of min to mean scale
     min_scale = scales.min(dim=-1)[0]  # [N]
     mean_scale = scales.mean(dim=-1)   # [N]
@@ -464,6 +468,9 @@ def scale_regularization_loss(
     # Regularize to encourage disc-like Gaussians
     # Loss = lambda * min_scale / mean_scale (want this small)
     loss = lambda_scale * (min_scale / (mean_scale + 1e-6)).mean()
+    
+    if debug:
+        print(f"  [Scale Loss] Processing {num_gaussians} Gaussians, loss={loss.item():.8f}")
     
     return loss
 

@@ -73,6 +73,35 @@ def get_expon_lr_func(
 
     return helper
 
+def get_linear_lr_func(
+    lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
+):
+    """
+    Linear learning rate decay function.
+    
+    The returned rate is lr_init when step=0 and lr_final when step=max_steps, and
+    is linearly interpolated elsewhere.
+    
+    Note: lr_delay_steps and lr_delay_mult are accepted but ignored (for API compatibility).
+    
+    :param lr_init: float, initial learning rate
+    :param lr_final: float, final learning rate
+    :param lr_delay_steps: int, ignored (for API compatibility)
+    :param lr_delay_mult: float, ignored (for API compatibility)
+    :param max_steps: int, the number of steps during optimization
+    :return: function which takes step as input and returns learning rate
+    """
+    
+    def helper(step):
+        if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+            # Disable this parameter
+            return 0.0
+        t = np.clip(step / max_steps, 0, 1)
+        # Simple linear interpolation: lr = lr_init + (lr_final - lr_init) * t
+        return lr_init + (lr_final - lr_init) * t
+    
+    return helper
+
 def strip_lowerdiag(L):
     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
 

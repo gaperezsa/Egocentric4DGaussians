@@ -58,11 +58,31 @@ class Deformation(nn.Module):
             self.feature_out.append(nn.ReLU())
             self.feature_out.append(nn.Linear(self.W,self.W))
         self.feature_out = nn.Sequential(*self.feature_out)
+        
+        # Position deformation head - initialize to output zero
         self.pos_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
+        nn.init.constant_(self.pos_deform[-1].weight, 0)
+        nn.init.constant_(self.pos_deform[-1].bias, 0)
+        
+        # Scales deformation head - initialize to output zero
         self.scales_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
+        nn.init.constant_(self.scales_deform[-1].weight, 0)
+        nn.init.constant_(self.scales_deform[-1].bias, 0)
+        
+        # Rotations deformation head - initialize to output zero
         self.rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
+        nn.init.constant_(self.rotations_deform[-1].weight, 0)
+        nn.init.constant_(self.rotations_deform[-1].bias, 0)
+        
+        # Opacity deformation head - initialize to output zero
         self.opacity_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
+        nn.init.constant_(self.opacity_deform[-1].weight, 0)
+        nn.init.constant_(self.opacity_deform[-1].bias, 0)
+        
+        # SHs deformation head - initialize to output zero
         self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
+        nn.init.constant_(self.shs_deform[-1].weight, 0)
+        nn.init.constant_(self.shs_deform[-1].bias, 0)
 
     def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
 
@@ -214,6 +234,66 @@ class deform_network(nn.Module):
         return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())
     def get_grid_parameters(self):
         return self.deformation_net.get_grid_parameters()
+    
+    def compute_t0_regularization(self, points, scales, rotations, opacity, shs, num_samples=1000):
+        """
+        Compute regularization loss that enforces zero deformation at t=0.
+        This is a strong constraint: at time 0, the network should output no deformation.
+        
+        Args:
+            points: [N, 3] input points
+            scales: [N, 3] scales
+            rotations: [N, 4] rotations  
+            opacity: [N, 1] opacity
+            shs: [N, 16*3] spherical harmonics
+            num_samples: How many points to sample for computing loss (for efficiency)
+        
+        Returns:
+            Scalar loss value
+        """
+        import torch
+        
+        # Sample points for efficiency (don't need to compute on all points every iteration)
+        n_points = points.shape[0]
+        if n_points > num_samples:
+            sample_idx = torch.randperm(n_points, device=points.device)[:num_samples]
+            points_sampled = points[sample_idx]
+            scales_sampled = scales[sample_idx] if scales is not None else None
+            rotations_sampled = rotations[sample_idx] if rotations is not None else None
+            opacity_sampled = opacity[sample_idx] if opacity is not None else None
+            shs_sampled = shs[sample_idx] if shs is not None else None
+        else:
+            points_sampled = points
+            scales_sampled = scales
+            rotations_sampled = rotations
+            opacity_sampled = opacity
+            shs_sampled = shs
+        
+        # Create time tensor for t=0
+        time_t0 = torch.zeros((points_sampled.shape[0], 1), device=points_sampled.device)
+        
+        # Get deformation at t=0
+        means3D_t0, scales_t0, rotations_t0, opacity_t0, shs_t0 = self.forward_dynamic(
+            points_sampled, scales_sampled, rotations_sampled, opacity_sampled, shs_sampled, time_t0
+        )
+        
+        # Compute deformation offsets
+        pos_deform = means3D_t0 - points_sampled
+        scales_deform = scales_t0 - scales_sampled if scales_sampled is not None else torch.zeros_like(scales_t0)
+        rot_deform = rotations_t0 - rotations_sampled if rotations_sampled is not None else torch.zeros_like(rotations_t0)
+        opacity_deform = opacity_t0 - opacity_sampled if opacity_sampled is not None else torch.zeros_like(opacity_t0)
+        shs_deform = shs_t0 - shs_sampled if shs_sampled is not None else torch.zeros_like(shs_t0)
+        
+        # L1 regularization on deformation magnitudes
+        reg_loss = (
+            torch.abs(pos_deform).mean() +
+            torch.abs(scales_deform).mean() +
+            torch.abs(rot_deform).mean() +
+            torch.abs(opacity_deform).mean() +
+            torch.abs(shs_deform).mean()
+        ) / 5.0  # Average across components
+        
+        return reg_loss
 
 def initialize_weights(m):
     if isinstance(m, nn.Linear):

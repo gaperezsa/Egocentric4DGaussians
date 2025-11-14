@@ -11,7 +11,7 @@ conda activate Gaussians4D
 # ====================================================================
 python train_dynamic_depth.py \
   --batch_size 4 \
-  --background_depth_iterations 500 \
+  --background_depth_iterations 1 \
   --background_RGB_iterations 500 \
   --dynamics_depth_iterations 500 \
   --dynamics_RGB_iterations 500 \
@@ -23,7 +23,7 @@ python train_dynamic_depth.py \
   --ssim_weight 0.5 \
   --chamfer_weight 100.0 \
   --plane_tv_weight 0.001 \
-  --configs "arguments/HOI4D/default.py" \
+  --configs "arguments/ADT/default.py" \
   --port 6254 \
-  --expname video1_normals_with_gsplat_debug \
-  --source_path "data/with_monst3r/Video1/colmap" \
+  --expname recognition_inital_debug \
+  --source_path "data/ADT/recognition/colmap" \

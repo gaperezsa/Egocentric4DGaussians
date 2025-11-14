@@ -41,6 +41,7 @@ import lpips
 from utils.scene_utils import render_training_image, debug_render_training_image_by_mask
 from utils.render_utils import prune_by_visibility, prune_by_average_radius, look_at
 from utils.metric_visualization_utils import generate_psnr_heatmaps_for_folder
+from utils.pruning_utils import prune_invisible_dynamic_gaussians
 from time import time
 import copy
 import json
@@ -211,6 +212,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 if not viewpoint_stack:
                     if viewpoint_cams:
                         break
+                    # Refill from full camera list
                     viewpoint_stack = temp_list.copy()
                 # Sample a random view from the remaining stack
                 rand_index = randint(0, len(viewpoint_stack) - 1)
@@ -383,7 +385,8 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             
             # Scale regularization: encourage disc-like Gaussians
             if hyper.normal_loss_weight > 0:
-                scale_loss = scale_regularization_loss(gaussians.get_scaling, lambda_scale=0.01)
+                num_gaussians_before = gaussians.get_xyz.shape[0]
+                scale_loss = scale_regularization_loss(lambda: gaussians.get_scaling, lambda_scale=0.01, debug=(iteration % 100 == 0))
         
         # ------------------ STAGE: background_RGB ------------------
         elif stage == "background_RGB":
@@ -431,7 +434,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             
             # Scale regularization
             if hyper.normal_loss_weight > 0:
-                scale_loss = scale_regularization_loss(gaussians.get_scaling, lambda_scale=0.01)
+                scale_loss = scale_regularization_loss(lambda: gaussians.get_scaling, lambda_scale=0.01)
         
         # ------------------ STAGE: dynamics_depth ------------------
         elif stage == "dynamics_depth":
@@ -511,7 +514,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             
             # Scale regularization
             if hyper.normal_loss_weight > 0:
-                scale_loss = scale_regularization_loss(gaussians.get_scaling, lambda_scale=0.01)
+                scale_loss = scale_regularization_loss(lambda: gaussians.get_scaling, lambda_scale=0.01)
             
             # SSIM loss
             if hyper.ssim_weight != 0:
@@ -534,6 +537,25 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
              + hyper.plane_tv_weight * local_tv_loss
 
         # ====================================================================
+        # REGULARIZATION: Enforce zero deformation at t=0
+        # ====================================================================
+        # During dynamics_depth and dynamics_RGB stages, penalize any deformation at t=0
+        # This forces the network to learn: at time 0, output ZERO displacement
+        t0_reg = torch.tensor(0.0, device=Ll1.device)  # Initialize to zero
+        t0_reg_weight = 1.0
+        if stage in ("dynamics_depth", "dynamics_RGB") and hasattr(gaussians, '_deformation'):
+            t0_reg_weight = 100.0  # Strength of the regularization
+            t0_reg = gaussians._deformation.compute_t0_regularization(
+                points=gaussians._xyz[gaussians._dynamic_xyz],
+                scales=gaussians._scaling[gaussians._dynamic_xyz],
+                rotations=gaussians._rotation[gaussians._dynamic_xyz],
+                opacity=gaussians._opacity[gaussians._dynamic_xyz],
+                shs=gaussians._features_dc[gaussians._dynamic_xyz],
+                num_samples=min(2000, gaussians._dynamic_xyz.sum().item())
+            )
+            loss = loss + t0_reg_weight * t0_reg
+
+        # ====================================================================
         # Log loss magnitudes and weighted contributions (every N iterations)
         # COMPREHENSIVE DEBUG: Show all losses for all stages (even if zero)
         # ====================================================================
@@ -546,6 +568,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             weighted_scale = hyper.scale_loss_weight * scale_loss.item()
             weighted_ssim = hyper.ssim_weight * ssim_loss_val.item()
             weighted_tv = hyper.plane_tv_weight * local_tv_loss.item()
+            weighted_t0_reg = t0_reg_weight * t0_reg.item()
             
             # Track which losses were actually computed (not just zero)
             depth_computed = (stage in ("background_depth", "background_RGB", "dynamics_RGB", "fine_coloring"))
@@ -556,6 +579,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                             hyper.normal_loss_weight > 0)
             ssim_computed = (stage == "fine_coloring" and hyper.ssim_weight != 0)
             tv_computed = (stage in ("dynamics_RGB", "fine_coloring") and hyper.plane_tv_weight > 0)
+            t0_reg_computed = (stage in ("dynamics_depth", "dynamics_RGB") and hasattr(gaussians, '_deformation'))
             rgb_computed = (stage in ("background_RGB", "dynamics_RGB", "fine_coloring"))
             
             # Stage-specific sanity checks
@@ -582,6 +606,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             print(format_loss_line("Scale Loss:", scale_loss.item(), hyper.scale_loss_weight, weighted_scale, scale_computed))
             print(format_loss_line("SSIM Loss:", ssim_loss_val.item(), hyper.ssim_weight, weighted_ssim, ssim_computed))
             print(format_loss_line("Spacetime TV:", local_tv_loss.item(), hyper.plane_tv_weight, weighted_tv, tv_computed))
+            print(format_loss_line("T=0 Regularization:", t0_reg.item(), t0_reg_weight, weighted_t0_reg, t0_reg_computed))
             
             print(f"  {'-'*70}")
             print(f"  TOTAL LOSS:        {loss.item():12.6f}")
@@ -655,7 +680,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                         or (iteration < 60000 and iteration %  100 == 1) \
                             or (iteration < 200000 and iteration %  100 == 1) :
                             # breakpoint()
-                            render_training_image(scene, gaussians, [test_cams[0%len(test_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [train_cams[0]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
                             #render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
                             # Removed dyn_splat PNG output to save time and disk space
                             
@@ -668,7 +693,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
             # Densification
             if (iteration > opt.densify_from_iter or iteration > opt.pruning_from_iter) and stage != "dynamics_depth":
-                
                 # Keep track of max radii in image-space for pruning
                 # Keeping track of densification stats
                 if stage == "dynamics_RGB":
@@ -693,6 +717,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 
                 # Densify if in the middle of training
                 if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter and iteration < int(0.8 * final_iter) and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<400000:
+                    
                     percentage_of_train_stage_remaining = 1-(iteration/final_iter)
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist, percentage_of_train_stage_remaining )
                 
@@ -739,14 +764,31 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     )
                     print(f"pruning in iter:{iteration}")
                     
-                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage not in ("dynamics_RGB","fine_coloring"):
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage not in ("dynamics_RGB","fine_coloring", "background_depth"):
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
                     print(f"growing in iter:{iteration}")
                 if iteration % opt.opacity_reset_interval == 0:
                     gaussians.reset_opacity()
                     print(f"reseting opacity in iter:{iteration}")
 
-            # Optimizer step
+            
+
+            # Special pruning at end of dynamics_depth stage: Remove dynamic Gaussians not visible in canonical time
+            if (stage == "dynamics_depth" and iteration == final_iter) or (stage == "dynamics_RGB" and iteration == first_iter+1):
+                print("\n" + "="*80)
+                print("[DYNAMICS_DEPTH FINAL PRUNING] Removing dynamic Gaussians invisible in canonical time")
+                print("="*80)
+                prune_invisible_dynamic_gaussians(
+                    gaussians=gaussians,
+                    scene=scene,
+                    pipe=pipe,
+                    background=background,
+                    stage=stage,
+                    num_cameras=5
+                )
+                print("="*80 + "\n")
+
+                # Optimizer step
             if iteration < train_iter:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
@@ -787,10 +829,10 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                     current_stage = stages[i]
                 elif i+1 >= len(stages):
                     current_stage = "final"
-                    render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
+                    render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
                 else:
                     current_stage = stages[i+1]
-                    render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
+                    render_set_no_compression(dataset.model_path, stages[i] +"_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
                 break
     
 
@@ -811,9 +853,16 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
     
     if  current_stage == stages[2]:
         # Initialize dynamic gaussians in the model
-        gaussians.spawn_dynamic_gaussians(random_init = False, precomputed_positions = list(scene.getTrainCameras())[10].backproject_mask_to_world())
-        print("\n[OPTIMIZATION] Per-camera point cloud caching enabled for dynamics_depth stage")
-        print("               Backprojection computed once per camera, cached in RAM (~108 MB)")
+        gaussians.spawn_dynamic_gaussians(random_init = False, precomputed_positions = list(scene.getTrainCameras())[1].backproject_mask_to_world())
+        
+        # FREEZE dynamic XYZ positions: We want the deformation network to learn temporal motion,
+        # NOT to change the initialization. The spawn positions are perfect, so keep them fixed.
+        if hasattr(gaussians, '_dynamic_xyz'):
+            dynamic_mask = gaussians._dynamic_xyz
+            gaussians._xyz.data[dynamic_mask].requires_grad = False
+            print(f"✓ FROZEN dynamic Gaussian XYZ positions ({dynamic_mask.sum().item()} points)")
+            print(f"  → Only deformation network will learn motion from t=0 position")
+        
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "dynamics_depth", tb_writer, using_wandb, training_iters[2], timer, first_iters[2])

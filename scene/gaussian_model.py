@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, steep_sigmoid, inv_steep_sigmoid
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func, get_linear_lr_func,  build_rotation, steep_sigmoid, inv_steep_sigmoid
 from torch import nn
 import os
 import open3d as o3d
@@ -216,8 +216,8 @@ class GaussianModel:
             # broadcast: dynamic rows get dynamic LR, static get static LR
             scale_factors = m * self._lr_dynamic + (~m) * self._lr_static
             grad.mul_(scale_factors)
-        
-        if stage in ("background_depth","background_RGB"):
+
+        if stage == "background_depth":
             # 1) sanity check
             N = self._xyz.shape[0]
             assert self._dynamic_xyz.shape[0] == N, \
@@ -228,6 +228,43 @@ class GaussianModel:
 
             l = [
                 {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
+                {'params': list(self._deformation.get_mlp_parameters()), 'lr': 0, "name": "deformation"},
+                {'params': list(self._deformation.get_grid_parameters()), 'lr': 0, "name": "grid"},
+                {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            ]
+            max_steps = max(training_args.position_lr_max_steps, training_args.background_RGB_iterations, training_args.background_depth_iterations)
+            self.static_xyz_scheduler_args = get_linear_lr_func(lr_init=training_args.static_position_lr_init * self.spatial_lr_scale,
+                                                    lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=max_steps)
+            self.dynamic_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
+                                                    lr_final=0,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=max_steps)
+            self.deformation_scheduler_args = get_expon_lr_func(lr_init=0,
+                                                    lr_final=0,
+                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
+                                                    max_steps=max_steps)
+            self.grid_scheduler_args = get_expon_lr_func(lr_init=0,
+                                                    lr_final=0,
+                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
+                                                    max_steps=max_steps)
+
+        elif stage == "background_RGB":
+            # 1) sanity check
+            N = self._xyz.shape[0]
+            assert self._dynamic_xyz.shape[0] == N, \
+                f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
+
+            # Register hook
+            self._xyz.register_hook(_dynamic_grad_hook)
+
+            l = [
+                {'params': [self._xyz], 'lr': 0.1, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': 0, "name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()), 'lr': 0, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -275,6 +312,8 @@ class GaussianModel:
                 {'params': [self._rotation],      'lr': 0, "name": "rotation"},
             ]
             max_steps = min(training_args.position_lr_max_steps, training_args.dynamics_depth_iterations)
+            warmup_steps = int(0.1 * max_steps)  # First 10% of iterations
+            
             self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=0,
                                                     lr_final=0,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -283,14 +322,43 @@ class GaussianModel:
                                                     lr_final=training_args.dynamic_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
-            self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.deformation_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
-                                                    max_steps=max_steps)  
-            self.grid_scheduler_args = get_expon_lr_func(lr_init=training_args.grid_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.grid_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
-                                                    max_steps=max_steps)
+            
+            # WARMUP-AWARE DEFORMATION SCHEDULERS: Reduced influence for first 10%
+            # Create base schedulers
+            base_deformation_scheduler = get_expon_lr_func(
+                lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
+                lr_final=training_args.deformation_lr_final*self.spatial_lr_scale,
+                lr_delay_mult=training_args.deformation_lr_delay_mult,
+                max_steps=max_steps
+            )
+            base_grid_scheduler = get_expon_lr_func(
+                lr_init=training_args.grid_lr_init*self.spatial_lr_scale,
+                lr_final=training_args.grid_lr_final*self.spatial_lr_scale,
+                lr_delay_mult=training_args.deformation_lr_delay_mult,
+                max_steps=max_steps
+            )
+            
+            # Wrap with warmup scaling (10% LR during first 10% of iterations)
+            def warmup_scaled_scheduler(base_fn, warmup_threshold, scale_factor=0.1):
+                def wrapper(step):
+                    base_lr = base_fn(step)
+                    if step < warmup_threshold:
+                        # Reduce deformation network influence during warmup
+                        return base_lr * scale_factor
+                    else:
+                        return base_lr
+                return wrapper
+            
+            self.deformation_scheduler_args = warmup_scaled_scheduler(
+                base_deformation_scheduler, 
+                warmup_steps, 
+                scale_factor=0.1  # 10% of normal LR during warmup
+            )
+            self.grid_scheduler_args = warmup_scaled_scheduler(
+                base_grid_scheduler, 
+                warmup_steps, 
+                scale_factor=0.1  # 10% of normal LR during warmup
+            )
 
         elif stage == "dynamics_RGB":
 
@@ -769,12 +837,40 @@ class GaussianModel:
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_dynamic_xyz = self._dynamic_xyz[selected_pts_mask].repeat(N)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        
+        # Initialize new scales: divide by (0.8*N) but preserve the minimum scale of each parent
+        # This keeps the child's thinness from the parent while allowing scale loss to reshape it
+        parent_scales = self.get_scaling[selected_pts_mask].repeat(N,1)  # [M, 3]
+        
+        # Standard division by 0.8*N
+        new_scales_divided = parent_scales / (0.8*N)  # [M, 3]
+        
+        # Find minimum scale component for each parent (before division)
+        parent_min_scale = torch.min(parent_scales[:parent_scales.shape[0]//N], dim=1, keepdim=True).values  # [M//N, 1]
+        parent_min_scale = parent_min_scale.repeat(N, 1)  # [M, 1] - repeat for all N children
+        
+        # Ensure minimum scale is preserved (not allowed to go smaller than parent's minimum)
+        new_scales_clamped = torch.clamp_min(new_scales_divided, parent_min_scale)
+        
+        new_scaling = self.scaling_inverse_activation(new_scales_clamped)
+        
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
+        
+        # DEBUG: Check scale characteristics of newly split Gaussians
+        with torch.no_grad():
+            new_scales_activated = self.scaling_activation(new_scaling)
+            min_scales = new_scales_activated.min(dim=1)[0]
+            max_scales = new_scales_activated.max(dim=1)[0]
+            mean_scales = new_scales_activated.mean(dim=1)
+            ratio = min_scales / (mean_scales + 1e-6)
+            print(f"  [Densify Split] Creating {new_xyz.shape[0]} Gaussians")
+            print(f"    Scale ratio (min/mean): {ratio.mean():.6f} ± {ratio.std():.6f}")
+            print(f"    Min scale: {min_scales.mean():.6f}, Max scale: {max_scales.mean():.6f}")
+        
         self.densification_postfix(new_xyz, new_dynamic_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
