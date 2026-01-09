@@ -63,7 +63,13 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
-        self.depth_outlier_hits = torch.empty(0)
+        
+        # NEW: Temporal depth error tracking (replaces depth_outlier_hits)
+        self._depth_error_sum = torch.empty(0)      # Accumulated error magnitude (meters)
+        self._depth_error_count = torch.empty(0)    # Number of times blamed
+        self._depth_error_max = torch.empty(0)      # Worst single error seen
+        self._birth_iteration = torch.empty(0)      # When this Gaussian was created (for fair pruning)
+        
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -88,7 +94,10 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
-            self.depth_outlier_hits,
+            self._depth_error_sum,
+            self._depth_error_count,
+            self._depth_error_max,
+            self._birth_iteration,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -109,7 +118,10 @@ class GaussianModel:
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
-        depth_outlier_hits,
+        depth_error_sum,
+        depth_error_count,
+        depth_error_max,
+        birth_iteration,
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self._deformation.load_state_dict(deform_state)
@@ -117,7 +129,10 @@ class GaussianModel:
             self.training_setup(training_args, stage)
             self.xyz_gradient_accum = xyz_gradient_accum
             self.denom = denom
-            self.depth_outlier_hits = depth_outlier_hits
+            self._depth_error_sum = depth_error_sum
+            self._depth_error_count = depth_error_count
+            self._depth_error_max = depth_error_max
+            self._birth_iteration = birth_iteration
             self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -677,7 +692,13 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((n,1), device=self._xyz.device)
         self._deformation_accum = torch.zeros((n,3), device=self._xyz.device)
         self.denom              = torch.zeros((n,1), device=self._xyz.device)
-        self.depth_outlier_hits = torch.zeros((n,1), device=self._xyz.device)
+        
+        # NEW: Reset depth error stats (but preserve what remains after pruning)
+        self._depth_error_sum = self._depth_error_sum[valid]
+        self._depth_error_count = self._depth_error_count[valid]
+        self._depth_error_max = self._depth_error_max[valid]
+        self._birth_iteration = self._birth_iteration[valid]
+        
         self.max_radii2D        = torch.zeros((n,),  device=self._xyz.device)
 
         # 7) If we had a hook, re‐install it now
@@ -794,10 +815,26 @@ class GaussianModel:
             self.denom,
             torch.zeros((M,1), device=dev)
         ], dim=0)
-        self.depth_outlier_hits= torch.cat([
-            self.depth_outlier_hits,
+        
+        # Initialize depth error tracking for new Gaussians
+        self._depth_error_sum = torch.cat([
+            self._depth_error_sum,
             torch.zeros((M,1), device=dev)
         ], dim=0)
+        self._depth_error_count = torch.cat([
+            self._depth_error_count,
+            torch.zeros((M,1), device=dev)
+        ], dim=0)
+        self._depth_error_max = torch.cat([
+            self._depth_error_max,
+            torch.zeros((M,1), device=dev)
+        ], dim=0)
+        # Birth iteration will be set by set_birth_iteration() call after this
+        self._birth_iteration = torch.cat([
+            self._birth_iteration,
+            torch.zeros((M,1), dtype=torch.int32, device=dev)
+        ], dim=0)
+        
         self.max_radii2D      = torch.cat([
             self.max_radii2D,
             torch.zeros((M,), device=dev)
@@ -1229,9 +1266,16 @@ class GaussianModel:
         min_opacity,
         max_scale,
         max_screen_size,
-        max_outlier_hits: int = None):
+        depth_error_threshold_cm: float = None,
+        min_depth_observations: int = 5,
+        current_iteration: int = 0,
+        min_iterations_alive: int = 100):
         
-        prune_mask = self.compute_prune_mask(min_opacity, max_scale, max_screen_size, max_outlier_hits)
+        prune_mask = self.compute_prune_mask(
+            min_opacity, max_scale, max_screen_size,
+            depth_error_threshold_cm, min_depth_observations,
+            current_iteration, min_iterations_alive
+        )
 
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
@@ -1273,6 +1317,52 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+    
+    def update_depth_error_stats(self, gaussian_indices, error_magnitudes):
+        """
+        Accumulate depth error statistics for Gaussians that contributed to bad pixels.
+        
+        Args:
+            gaussian_indices: [M] tensor of Gaussian indices to blame
+            error_magnitudes: [M] tensor of error magnitudes in meters
+        """
+        if gaussian_indices.numel() == 0:
+            return
+        
+        # Accumulate error sum
+        self._depth_error_sum.index_add_(0, gaussian_indices, error_magnitudes.unsqueeze(-1))
+        
+        # Increment blame count
+        ones = torch.ones_like(error_magnitudes, dtype=self._depth_error_count.dtype).unsqueeze(-1)
+        self._depth_error_count.index_add_(0, gaussian_indices, ones)
+        
+        # Update max error seen
+        for idx, err in zip(gaussian_indices, error_magnitudes):
+            current_max = self._depth_error_max[idx, 0]
+            if err > current_max:
+                self._depth_error_max[idx, 0] = err
+    
+    def reset_depth_error_stats(self):
+        """Reset depth error accumulators (called at pruning iterations and stage transitions)"""
+        self._depth_error_sum.zero_()
+        self._depth_error_count.zero_()
+        self._depth_error_max.zero_()
+    
+    def reset_densification_stats(self):
+        """Reset gradient-based densification accumulators (called at stage transitions)"""
+        self.xyz_gradient_accum.zero_()
+        self.denom.zero_()
+    
+    def set_birth_iteration(self, start_idx, end_idx, iteration):
+        """
+        Set birth iteration for newly created Gaussians.
+        
+        Args:
+            start_idx: Starting index of new Gaussians
+            end_idx: Ending index (exclusive)
+            iteration: Current training iteration
+        """
+        self._birth_iteration[start_idx:end_idx] = iteration
 
     @torch.no_grad()
     def find_outlier_gaussians_and_update_hits(

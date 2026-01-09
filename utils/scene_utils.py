@@ -9,13 +9,16 @@ import numpy as np
 
 import copy
 @torch.no_grad()
-def render_training_image(scene, gaussians, viewpoints, render_func, pipe, background, stage, iteration, time_now, dataset_type):
+def render_training_image(scene, gaussians, viewpoints, render_func, pipe, background, stage, iteration, time_now, dataset_type, aria_rotated=False):
     """
     Render training images with 2-row layout:
     - Top row: GT RGB, GT Depth, GT Normal
     - Bottom row: Rendered RGB, Rendered Depth, Rendered Normal
     
     This layout makes vertical comparison easy for debugging.
+    
+    Args:
+        aria_rotated: If True, rotate all images 90° CW for natural viewing of raw Aria orientation data
     """
     def render(gaussians, viewpoint, path, scaling, cam_type):
         # Get all rendered data
@@ -52,6 +55,12 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
             # Fallback: use black (no normal data)
             gt_normal = np.zeros_like(gt_rgb)
         
+        # Rotate GT images 90° CW for Aria visualization (if raw Aria orientation)
+        if aria_rotated:
+            gt_rgb = np.rot90(gt_rgb, k=3)  # 90° CW
+            gt_depth_norm = np.rot90(gt_depth_norm, k=3)
+            gt_normal = np.rot90(gt_normal, k=3)
+        
         # ====================================================================
         # Get Rendered Data
         # ====================================================================
@@ -69,6 +78,12 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
         else:
             # Fallback: use black (no normal rendering)
             rendered_normal = np.zeros_like(rendered_rgb)
+        
+        # Rotate rendered images 90° CW for Aria visualization (if raw Aria orientation)
+        if aria_rotated:
+            rendered_rgb = np.rot90(rendered_rgb, k=3)  # 90° CW
+            rendered_depth_norm = np.rot90(rendered_depth_norm, k=3)
+            rendered_normal = np.rot90(rendered_normal, k=3)
         
         # ====================================================================
         # Create 2-row, 3-column layout

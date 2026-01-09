@@ -8,6 +8,339 @@ import os
 from PIL import Image
 import cv2
 
+"""
+Chamfer-based pruning utilities for dynamic Gaussians.
+
+This module provides pruning strategies based on Chamfer distance at canonical time,
+removing dynamic Gaussians that contribute most to the reconstruction error.
+"""
+
+import torch
+import numpy as np
+import os
+from PIL import Image
+from tqdm import tqdm
+
+
+def compute_chamfer_distances_per_gaussian(dynamic_xyz, gt_pointcloud):
+    """
+    Compute per-Gaussian Chamfer distances to ground truth point cloud.
+    
+    For each dynamic Gaussian, finds the distance to its nearest GT point.
+    This identifies which Gaussians are "outliers" far from the true dynamic object.
+    
+    Args:
+        dynamic_xyz: [M, 3] tensor of dynamic Gaussian positions (deformed or canonical)
+        gt_pointcloud: [N, 3] tensor of ground truth 3D points from dynamic mask
+    
+    Returns:
+        distances: [M] tensor of nearest-neighbor distances for each Gaussian
+    """
+    # Compute pairwise distances: [M, N]
+    # ||a - b||^2 = ||a||^2 + ||b||^2 - 2<a, b>
+    dynamic_xyz_sq = (dynamic_xyz ** 2).sum(dim=1, keepdim=True)  # [M, 1]
+    gt_pointcloud_sq = (gt_pointcloud ** 2).sum(dim=1, keepdim=True)  # [N, 1]
+    
+    # [M, N] = [M, 1] + [1, N] - 2 * [M, 3] @ [3, N]
+    pairwise_sq = dynamic_xyz_sq + gt_pointcloud_sq.T - 2.0 * (dynamic_xyz @ gt_pointcloud.T)
+    pairwise_sq = torch.clamp(pairwise_sq, min=0.0)  # Numerical stability
+    
+    # For each Gaussian, find distance to nearest GT point
+    min_distances, _ = pairwise_sq.min(dim=1)  # [M]
+    distances = torch.sqrt(min_distances)
+    
+    return distances
+
+
+def prune_high_chamfer_dynamic_gaussians(
+    gaussians, 
+    scene, 
+    stage, 
+    gt_pointcloud_cache,
+    prune_percent=0.20,
+    num_time_samples=5
+):
+    """
+    Prune dynamic Gaussians that contribute most to Chamfer loss at canonical/near-canonical time.
+    
+    Strategy:
+    1. Get the first N training cameras closest to t=0.
+    2. For each camera, deform Gaussians to its specific time.
+    3. Compute per-Gaussian distance to that camera's GT point cloud.
+    4. Aggregate distances across all sampled cameras (max distance).
+    5. Prune top X% of Gaussians with highest distances.
+    
+    Args:
+        gaussians: GaussianModel with dynamic Gaussians and deformation network
+        scene: Scene object containing cameras
+        stage: Current training stage (should be "dynamics_depth")
+        gt_pointcloud_cache: Dict mapping camera uid -> [N, 3] GT point cloud tensor
+        prune_percent: Fraction of worst Gaussians to remove (0.0 to 1.0)
+        num_time_samples: Number of cameras to sample near canonical time
+    """
+    device = gaussians.get_xyz.device
+    n_gaussians = gaussians.get_xyz.shape[0]
+    
+    # Get dynamic Gaussian mask
+    dynamic_mask = gaussians._dynamic_xyz  # [N] boolean
+    n_dynamic = dynamic_mask.sum().item()
+    
+    if n_dynamic == 0:
+        print("  No dynamic Gaussians found, skipping Chamfer-based pruning")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"[CHAMFER-BASED PRUNING] Removing top {prune_percent*100:.1f}% worst dynamic Gaussians")
+    print(f"{'='*80}")
+    print(f"  Total Gaussians: {n_gaussians}")
+    print(f"  Dynamic Gaussians: {n_dynamic}")
+    
+    # Get canonical positions of dynamic Gaussians
+    dynamic_indices = torch.where(dynamic_mask)[0]
+    canonical_xyz = gaussians.get_xyz[dynamic_indices]  # [M, 3]
+    
+    # Get training cameras sorted by proximity to t=0
+    train_cams = list(scene.getTrainCameras())
+    train_cams_sorted = sorted(train_cams, key=lambda cam: abs(cam.time))  # Sort by distance from t=0
+    
+    # Use the first num_time_samples cameras that are in the cache
+    reference_cameras = []
+    for cam in train_cams_sorted:
+        if cam.uid in gt_pointcloud_cache:
+            reference_cameras.append(cam)
+        if len(reference_cameras) >= num_time_samples:
+            break
+            
+    if not reference_cameras:
+        print("  WARNING: No cameras found in gt_pointcloud_cache, skipping pruning")
+        return
+
+    print(f"  Using {len(reference_cameras)} cameras near t=0 for GT reference")
+    
+    # Track per-Gaussian distances across all sampled cameras
+    # We'll use the MAXIMUM distance (worst case) to identify consistent outliers
+    max_distances_per_gaussian = torch.zeros(n_dynamic, device=device)
+    
+    # For each reference camera
+    for cam in reference_cameras:
+        t_sample = cam.time
+        cam_id = cam.uid
+        gt_pointcloud = gt_pointcloud_cache[cam_id]
+        
+        if gt_pointcloud.shape[0] == 0:
+            continue
+            
+        print(f"  Sampling camera {cam_id} at t={t_sample:.4f}...")
+        
+        # Deform Gaussians to this time using the deformation network
+        with torch.no_grad():
+            if hasattr(gaussians, '_deformation') and gaussians._deformation is not None:
+                # Get deformation at this time - must be (N, 1) shape to match render path
+                time_tensor = torch.full((n_dynamic, 1), t_sample, device=device)
+                
+                # Get other Gaussian parameters for dynamic Gaussians
+                scales = gaussians._scaling[dynamic_indices]
+                rotations = gaussians._rotation[dynamic_indices]
+                opacity = gaussians._opacity[dynamic_indices]
+                shs = gaussians._features_dc[dynamic_indices]
+                
+                # Apply deformation network
+                deformed_xyz, _, _, _, _ = gaussians._deformation(
+                    canonical_xyz,
+                    scales,
+                    rotations,
+                    opacity,
+                    shs,
+                    time_tensor
+                )
+            else:
+                # No deformation network (shouldn't happen in dynamics_depth, but handle gracefully)
+                deformed_xyz = canonical_xyz
+        
+        # Compute per-Gaussian distances to nearest GT point
+        distances = compute_chamfer_distances_per_gaussian(deformed_xyz, gt_pointcloud)  # [M]
+        
+        # Update max distances (track worst case for each Gaussian)
+        max_distances_per_gaussian = torch.max(max_distances_per_gaussian, distances)
+        
+        # Log statistics for this camera
+        print(f"    Mean distance: {distances.mean().item():.4f}")
+        print(f"    Max distance:  {distances.max().item():.4f}")
+    
+    # Identify top X% worst Gaussians (highest Chamfer distances)
+    n_to_prune = int(n_dynamic * prune_percent)
+    
+    if n_to_prune == 0:
+        print(f"\n  ✓ Prune percent too low, no Gaussians to remove")
+        print(f"{'='*80}\n")
+        return
+    
+    # Get indices of top N worst Gaussians
+    _, worst_indices = torch.topk(max_distances_per_gaussian, n_to_prune, largest=True)
+    
+    # Convert to global Gaussian indices
+    worst_global_indices = dynamic_indices[worst_indices]
+    
+    # Create pruning mask
+    prune_mask = torch.zeros(n_gaussians, dtype=torch.bool, device=device)
+    prune_mask[worst_global_indices] = True
+    
+    # Log statistics
+    print(f"\n  Distance statistics for dynamic Gaussians:")
+    print(f"    Mean:   {max_distances_per_gaussian.mean().item():.4f}")
+    print(f"    Median: {max_distances_per_gaussian.median().item():.4f}")
+    print(f"    Max:    {max_distances_per_gaussian.max().item():.4f}")
+    print(f"    Min:    {max_distances_per_gaussian.min().item():.4f}")
+    
+    # Show threshold for pruning
+    prune_threshold = max_distances_per_gaussian[worst_indices[-1]].item()
+    print(f"\n  Pruning {n_to_prune}/{n_dynamic} dynamic Gaussians with distance > {prune_threshold:.4f}")
+    print(f"  Keeping {n_dynamic - n_to_prune} dynamic Gaussians")
+    
+    # Optional: Save visualization of distance distribution
+    debug_dir = os.path.join(scene.model_path, "pruning_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    
+    # Save histogram of distances
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 6))
+        distances_cpu = max_distances_per_gaussian.cpu().numpy()
+        plt.hist(distances_cpu, bins=50, alpha=0.7, edgecolor='black')
+        plt.axvline(prune_threshold, color='r', linestyle='--', linewidth=2, label=f'Prune threshold: {prune_threshold:.4f}')
+        plt.xlabel('Distance to nearest GT point')
+        plt.ylabel('Number of Gaussians')
+        plt.title(f'Chamfer Distance Distribution (Pruning top {prune_percent*100:.1f}%)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(debug_dir, f"chamfer_distances_prune_{prune_percent*100:.0f}pct.png"), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved distance histogram to {debug_dir}/chamfer_distances_prune_{prune_percent*100:.0f}pct.png")
+    except Exception as e:
+        print(f"  WARNING: Failed to save histogram: {e}")
+    
+    # Prune the worst dynamic Gaussians
+    gaussians.prune_points(prune_mask)
+    
+    # Report final counts
+    n_after = gaussians.get_xyz.shape[0]
+    n_dynamic_after = gaussians._dynamic_xyz.sum().item()
+    print(f"\n  Final counts: {n_after} total ({n_gaussians - n_after} removed), {n_dynamic_after} dynamic")
+    print(f"{'='*80}\n")
+
+
+def prune_high_chamfer_dynamic_gaussians_adaptive(
+    gaussians, 
+    scene, 
+    stage, 
+    gt_pointcloud_cache,
+    distance_threshold=0.05,
+    num_time_samples=5
+):
+    """
+    Adaptive variant: prune based on absolute distance threshold rather than percentage.
+    
+    Strategy:
+    1. Get the first N training cameras closest to t=0.
+    2. For each camera, deform Gaussians to its specific time.
+    3. Compute per-Gaussian distance to that camera's GT point cloud.
+    4. Aggregate distances across all sampled cameras (max distance).
+    5. Prune ALL Gaussians beyond the distance threshold.
+    
+    Args:
+        distance_threshold: Remove Gaussians with max distance > this value (in world units)
+        (other args same as prune_high_chamfer_dynamic_gaussians)
+    """
+    device = gaussians.get_xyz.device
+    n_gaussians = gaussians.get_xyz.shape[0]
+    
+    dynamic_mask = gaussians._dynamic_xyz
+    n_dynamic = dynamic_mask.sum().item()
+    
+    if n_dynamic == 0:
+        print("  No dynamic Gaussians found, skipping adaptive Chamfer-based pruning")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"[ADAPTIVE CHAMFER PRUNING] Removing Gaussians with distance > {distance_threshold:.4f}")
+    print(f"{'='*80}")
+    print(f"  Total Gaussians: {n_gaussians}")
+    print(f"  Dynamic Gaussians: {n_dynamic}")
+    
+    # Get canonical positions of dynamic Gaussians
+    dynamic_indices = torch.where(dynamic_mask)[0]
+    canonical_xyz = gaussians.get_xyz[dynamic_indices]
+    
+    # Get training cameras sorted by proximity to t=0
+    train_cams = list(scene.getTrainCameras())
+    train_cams_sorted = sorted(train_cams, key=lambda cam: abs(cam.time))
+    
+    # Use the first num_time_samples cameras that are in the cache
+    reference_cameras = []
+    for cam in train_cams_sorted:
+        if cam.uid in gt_pointcloud_cache:
+            reference_cameras.append(cam)
+        if len(reference_cameras) >= num_time_samples:
+            break
+            
+    if not reference_cameras:
+        print("  WARNING: No cameras found in gt_pointcloud_cache, skipping pruning")
+        return
+    
+    max_distances_per_gaussian = torch.zeros(n_dynamic, device=device)
+    
+    for cam in reference_cameras:
+        t_sample = cam.time
+        cam_id = cam.uid
+        gt_pointcloud = gt_pointcloud_cache[cam_id]
+        
+        if gt_pointcloud.shape[0] == 0:
+            continue
+            
+        with torch.no_grad():
+            if hasattr(gaussians, '_deformation') and gaussians._deformation is not None:
+                time_tensor = torch.full((n_dynamic, 1), t_sample, device=device)
+                scales = gaussians._scaling[dynamic_indices]
+                rotations = gaussians._rotation[dynamic_indices]
+                opacity = gaussians._opacity[dynamic_indices]
+                shs = gaussians.get_features[dynamic_indices]
+                
+                deformed_xyz, _, _, _, _ = gaussians._deformation(
+                    canonical_xyz, scales, rotations, opacity, shs, time_tensor
+                )
+            else:
+                deformed_xyz = canonical_xyz
+        
+        distances = compute_chamfer_distances_per_gaussian(deformed_xyz, gt_pointcloud)
+        max_distances_per_gaussian = torch.max(max_distances_per_gaussian, distances)
+    
+    # Prune based on absolute threshold
+    outlier_indices = torch.where(max_distances_per_gaussian > distance_threshold)[0]
+    n_to_prune = len(outlier_indices)
+    
+    if n_to_prune == 0:
+        print(f"\n  ✓ No Gaussians exceed distance threshold, no pruning needed")
+        print(f"{'='*80}\n")
+        return
+    
+    # Convert to global indices
+    outlier_global_indices = dynamic_indices[outlier_indices]
+    
+    # Create pruning mask
+    prune_mask = torch.zeros(n_gaussians, dtype=torch.bool, device=device)
+    prune_mask[outlier_global_indices] = True
+    
+    print(f"\n  Pruning {n_to_prune}/{n_dynamic} dynamic Gaussians (distance > {distance_threshold:.4f})")
+    print(f"  Keeping {n_dynamic - n_to_prune} dynamic Gaussians")
+    
+    # Prune
+    gaussians.prune_points(prune_mask)
+    
+    n_after = gaussians.get_xyz.shape[0]
+    n_dynamic_after = gaussians._dynamic_xyz.sum().item()
+    print(f"\n  Final counts: {n_after} total ({n_gaussians - n_after} removed), {n_dynamic_after} dynamic")
+    print(f"{'='*80}\n")
+
 
 def prune_invisible_dynamic_gaussians(gaussians, scene, pipe, background, stage, num_cameras=5):
     """

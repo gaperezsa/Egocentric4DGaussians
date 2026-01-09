@@ -19,7 +19,8 @@ ModelHiddenParams = dict(
     # ========== Other Hyperparameters ==========
     time_smoothness_weight = 0.001,
     l1_time_planes = 0.0001,
-    render_process=True
+    render_process=True,
+    aria_rotated = True  # Rotate visualizations 90° CW for ADT data (raw Aria orientation)
 )
 
 OptimizationParams = dict(
@@ -42,10 +43,10 @@ OptimizationParams = dict(
     deformation_lr_final = 0.0000016,
     
     # ========== Densification & Pruning Strategy ==========
-    densification_interval = 400,
+    densification_interval = 200,
     pruning_interval = 700,
     densify_until_iter = 5_000,
-    opacity_reset_interval = 300000,
+    opacity_reset_interval = 30000,
     scale_pruning_factor = 1.0
     # dataloader=True,
     # coarse_iterations = 3000,

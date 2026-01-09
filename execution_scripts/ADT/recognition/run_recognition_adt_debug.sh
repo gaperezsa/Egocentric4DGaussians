@@ -11,7 +11,7 @@ conda activate Gaussians4D
 # ====================================================================
 python train_dynamic_depth.py \
   --batch_size 16 \
-  --background_depth_iterations 6000 \
+  --background_depth_iterations 2000 \
   --background_RGB_iterations 3000 \
   --dynamics_depth_iterations 2000 \
   --dynamics_RGB_iterations 2000 \
@@ -23,7 +23,8 @@ python train_dynamic_depth.py \
   --ssim_weight 0.5 \
   --chamfer_weight 100.0 \
   --plane_tv_weight 0.001 \
+  --start_checkpoint /home/gperezsantamaria/sda_data/Egocentric4DGaussians/output/recognition_initial_debug4/chkpnt_background_RGB_1999.pth \
   --configs "arguments/ADT/default.py" \
-  --port 6259 \
-  --expname recognition_restarting_depth_color_simultaneus_debug \
+  --port 6258 \
+  --expname recognition_initial_debug4 \
   --source_path "data/ADT/recognition/colmap" \

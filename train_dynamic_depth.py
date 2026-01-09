@@ -41,7 +41,7 @@ import lpips
 from utils.scene_utils import render_training_image, debug_render_training_image_by_mask
 from utils.render_utils import prune_by_visibility, prune_by_average_radius, look_at
 from utils.metric_visualization_utils import generate_psnr_heatmaps_for_folder
-from utils.pruning_utils import prune_invisible_dynamic_gaussians
+from utils.pruning_utils import prune_high_chamfer_dynamic_gaussians, prune_high_chamfer_dynamic_gaussians_adaptive, prune_invisible_dynamic_gaussians
 from time import time
 import copy
 import json
@@ -100,6 +100,10 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
     
     # When transitioning between stages, the optimizer.zero_grad() from the last iteration
     gaussians.optimizer.zero_grad(set_to_none=True)
+
+    # Reset densification and depth error stats
+    gaussians.reset_densification_stats()
+    gaussians.reset_depth_error_stats()
 
     rendering_only_background_or_only_dynamic = stage != "fine_coloring"
     depth_only_stage = stage in ("background_depth", "dynamics_depth")
@@ -265,7 +269,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 viewpoint_cam, gaussians, pipe, background,
                 stage=stage, cam_type=scene.dataset_type,
                 training=rendering_only_background_or_only_dynamic,
-                render_normals=should_render_normals  # NEW: flag-based normal rendering
+                render_normals=should_render_normals
             )
             
             image, depth_image = pkg["render"], pkg["depth"]
@@ -279,7 +283,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             image_gradients.append(viewpoint_cam.get_image_gradient().unsqueeze(0))
             
             # Collect rendered RGB (only for RGB stages)
-            if stage in ("background_RGB", "dynamics_RGB", "fine_coloring"):
+            if stage in ("background_depth", "background_RGB", "dynamics_RGB", "fine_coloring"):
                 images.append(image.unsqueeze(0))
 
             # Always collect masks and depth
@@ -341,11 +345,90 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         
         
         # ====================================================================
+        # INLINE DEPTH ERROR BLAME ASSIGNMENT (Gradient-based approach)
+        # ====================================================================
+        # Use gradient information to identify which Gaussians contributed to bad depth pixels.
+        # This leverages the alpha compositing naturally tracked by the rasterizer's backward pass.
+        # 
+        # Key insight: When we backprop through the depth rendering, gradients flow back through
+        # the alpha-compositing formula: depth = Σ(α_i × d_i × T_i) where T_i = Π(1-α_j) for j<i
+        # The magnitude of gradient for each Gaussian indicates its contribution to the final pixel.
+        if stage != "dynamics_depth" and len(depth_images) > 0 and len(viewspace_point_tensor_list) > 0:
+            # Concatenate depth info across batch
+            depth_pred = torch.cat(depth_images, 0)  # [B, H, W]
+            depth_gt = torch.cat(gt_depth_images, 0)  # [B, H, W]
+            
+            # NOTE: viewspace_point_tensor is the same across all batch elements (it's per-Gaussian, not per-camera)
+            # We just need one copy
+            viewspace_points_tensor = viewspace_point_tensor_list[0]  # [N, 3] where N = num Gaussians
+            
+            # Define threshold for "bad" pixels
+            depth_error_threshold_m = opt.depth_error_threshold_cm / 100.0  # Convert cm to meters
+            
+            # Compute per-pixel depth error
+            depth_error = torch.abs(depth_pred - depth_gt)  # [B, H, W]
+            
+            # Apply stage-specific masking
+            if stage in ("background_depth", "background_RGB"):
+                static_mask = ~gt_dynamic_masks_tensor  # [B, H, W]
+                bad_pixel_mask = (depth_error > depth_error_threshold_m) & static_mask
+            else:
+                bad_pixel_mask = (depth_error > depth_error_threshold_m)
+            
+            num_bad_pixels = bad_pixel_mask.sum()
+            
+            if num_bad_pixels > 0:
+                # Create error map weighted by magnitude (only for bad pixels)
+                error_weights = torch.zeros_like(depth_error)
+                error_weights[bad_pixel_mask] = depth_error[bad_pixel_mask]
+                
+                # Compute blame signal: multiply error weights by predicted depth
+                # This will flow gradients back through the rendering to individual Gaussians
+                blame_signal = (error_weights * depth_pred).sum()
+                
+                # Clear any existing gradients on viewspace_points
+                if viewspace_points_tensor.grad is not None:
+                    viewspace_points_tensor.grad.zero_()
+                
+                # Run backward to compute per-Gaussian blame via gradient flow
+                # retain_graph=True preserves the computation graph for the main loss later
+                blame_signal.backward(retain_graph=True)
+                
+                # Extract gradient magnitudes as blame scores
+                if viewspace_points_tensor.grad is not None:
+                    # Gradient shape: [N, 3] (x, y, z screenspace coords with gradients)
+                    # Sum across spatial dimensions to get per-Gaussian blame magnitude
+                    grad_magnitudes = viewspace_points_tensor.grad.norm(dim=1)  # [N]
+                    
+                    # Only blame Gaussians with non-zero contribution
+                    blame_mask = grad_magnitudes > 1e-8  # Small threshold to avoid numerical noise
+                    blamed_indices = torch.where(blame_mask)[0]
+                    
+                    if blamed_indices.numel() > 0:
+                        # Record mean depth error for the bad pixels
+                        mean_error_value = depth_error[bad_pixel_mask].mean()
+                        
+                        # Assign error to all blamed Gaussians
+                        # The gradient magnitude tells us WHO contributed, 
+                        # the mean_error_value tells us HOW BAD the error was
+                        error_values = mean_error_value.repeat(blamed_indices.numel())
+                        
+                        # Update depth error statistics
+                        gaussians.update_depth_error_stats(blamed_indices, error_values)
+        
+        
+        # ====================================================================
         # STEP 3: Compute losses per stage (UNWEIGHTED, organized by stage)
         # ====================================================================
         
         # ------------------ STAGE: background_depth ------------------
         if stage == "background_depth":
+            # RGB loss: static regions only
+            image_tensor = torch.cat(images, 0)
+            gt_image_tensor = torch.cat(gt_images, 0)
+            mask = (~gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
+            Ll1 = l1_filtered_loss(image_tensor, gt_image_tensor[:, :3, :, :], mask)
+
             # Depth loss: static regions only
             mask = ~gt_dynamic_masks_tensor
             if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
@@ -580,7 +663,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             ssim_computed = (stage == "fine_coloring" and hyper.ssim_weight != 0)
             tv_computed = (stage in ("dynamics_RGB", "fine_coloring") and hyper.plane_tv_weight > 0)
             t0_reg_computed = (stage in ("dynamics_depth", "dynamics_RGB") and hasattr(gaussians, '_deformation'))
-            rgb_computed = (stage in ("background_RGB", "dynamics_RGB", "fine_coloring"))
+            rgb_computed = (stage in ("background_depth", "background_RGB", "dynamics_RGB", "fine_coloring"))
             
             # Stage-specific sanity checks
             stage_info = {
@@ -680,7 +763,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                         or (iteration < 60000 and iteration %  100 == 1) \
                             or (iteration < 200000 and iteration %  100 == 1) :
                             # breakpoint()
-                            render_training_image(scene, gaussians, [train_cams[0]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type)
+                            render_training_image(scene, gaussians, [train_cams[0]], render_with_dynamic_gaussians_mask, pipe, background, stage, iteration,timer.get_elapsed_time(),scene.dataset_type, aria_rotated=hyper.aria_rotated)
                             #render_training_image(scene, gaussians, [train_cams[500%len(train_cams)]], render_with_dynamic_gaussians_mask, pipe, background, stage+"_test_", iteration,timer.get_elapsed_time(),scene.dataset_type)
                             # Removed dyn_splat PNG output to save time and disk space
                             
@@ -718,54 +801,58 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 # Densify if in the middle of training
                 if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter and iteration < int(0.8 * final_iter) and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<400000:
                     
+                    # Track how many Gaussians existed before densification
+                    n_before = gaussians.get_xyz.shape[0]
+                    
                     percentage_of_train_stage_remaining = 1-(iteration/final_iter)
-                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist, percentage_of_train_stage_remaining )
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist, percentage_of_train_stage_remaining)
+                    
+                    # Set birth iteration for newly created Gaussians
+                    n_after = gaussians.get_xyz.shape[0]
+                    if n_after > n_before:
+                        gaussians.set_birth_iteration(n_before, n_after, iteration)
                 
                 # prune
-                if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
+                if iteration > opt.pruning_from_iter and iteration < int(0.8 * final_iter) and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>250000:
 
-                    #1) find & count outlier Gaussians on the last batch
-                    gaussians.find_outlier_gaussians_and_update_hits(
-                        viewpoint_cams,               # list of view cameras
-                        depth_image_tensor,           # [B,H,W]
-                        gt_depth_image_tensor,        # [B,H,W]
-                        error_thresh_cm = 0.05,       # e.g. 0.05
-                        topk_percent    = None,        # e.g. 0.10
-                        search_radius   = None        # or some world-space radius
-                    )
-
-                    ## FOR PRUNE DEBUGGGING PURPOSES ##
-
-                    # compute the mask *without* actually pruning:
-                    mask = gaussians.compute_prune_mask(
-                        opacity_threshold,
-                        max_scale = opt.scale_pruning_factor * scene.cameras_extent,
-                        max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2) ),
-                        max_outlier_hits = 3  # e.g. 3
-                    )
-
-                    # Dump a debug image showing ONLY those Gaussians:
-                    debug_render_training_image_by_mask(
-                        scene, gaussians, [test_cams[0]],
-                        render_with_dynamic_gaussians_mask,
-                        mask, pipe, background,
-                        stage, iteration,
-                        timer.get_elapsed_time(), scene.dataset_type
-                    )
-                    ####################################
-
-
-                    # 2) prune using all opacity + scale + image_size + depth outlier-hits
+                    # NEW: Time-aware depth-based pruning with fair comparison
+                    # Define stage-specific depth error thresholds
+                    if stage in ("background_depth", "background_RGB"):
+                        depth_error_threshold_cm = opt.static_depth_error_threshold_cm  # Strict for static (e.g., 15cm)
+                        min_depth_observations = 5  # Must be seen at least 5 times
+                        min_iterations_alive = 200  # Must be alive for 200 iterations
+                    elif stage == "dynamics_RGB":
+                        depth_error_threshold_cm = opt.dynamic_depth_error_threshold_cm  # Looser for dynamic (e.g., 20cm)
+                        min_depth_observations = 3  # Fewer observations needed (dynamic Gaussians less visible)
+                        min_iterations_alive = 100  # Can prune sooner
+                    else:  # fine_coloring
+                        depth_error_threshold_cm = opt.fine_depth_error_threshold_cm  # Strictest (e.g., 10cm)
+                        min_depth_observations = 8  # Must be consistently bad
+                        min_iterations_alive = 300  # Give more time to improve
+                    
+                    # Prune using new depth error stats
                     gaussians.prune(
                         opacity_threshold,
                         max_scale = opt.scale_pruning_factor * scene.cameras_extent,
-                        max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2) ),
-                        max_outlier_hits = 3  # e.g. 3
+                        max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2)),
+                        depth_error_threshold_cm=depth_error_threshold_cm,
+                        min_depth_observations=min_depth_observations,
+                        current_iteration=iteration,
+                        min_iterations_alive=min_iterations_alive
                     )
-                    print(f"pruning in iter:{iteration}")
+                    print(f"[ITER {iteration}] Pruned with depth error threshold: {depth_error_threshold_cm}cm")
+                    
+                    # RESET depth error stats after pruning (start fresh for next pruning interval)
+                    gaussians.reset_depth_error_stats()
+                    print(f"[ITER {iteration}] Reset depth error stats (accumulated since last prune)")
                     
                 if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<450000 and opt.add_point and stage not in ("dynamics_RGB","fine_coloring", "background_depth"):
+                    # Track growth
+                    n_before = gaussians.get_xyz.shape[0]
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
+                    n_after = gaussians.get_xyz.shape[0]
+                    if n_after > n_before:
+                        gaussians.set_birth_iteration(n_before, n_after, iteration)
                     print(f"growing in iter:{iteration}")
                 if iteration % opt.opacity_reset_interval == 0:
                     gaussians.reset_opacity()
@@ -773,20 +860,28 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
             
 
-            # Special pruning at end of dynamics_depth stage: Remove dynamic Gaussians not visible in canonical time
+            # Special pruning at end of dynamics_depth stage: Remove dynamic Gaussians with high Chamfer distance
             if (stage == "dynamics_depth" and iteration == final_iter) or (stage == "dynamics_RGB" and iteration == first_iter+1):
-                print("\n" + "="*80)
-                print("[DYNAMICS_DEPTH FINAL PRUNING] Removing dynamic Gaussians invisible in canonical time")
-                print("="*80)
-                prune_invisible_dynamic_gaussians(
+                # Use Chamfer-based pruning: removes Gaussians that are geometric outliers
+                # (far from GT point cloud at canonical/near-canonical time)
+                prune_high_chamfer_dynamic_gaussians(
                     gaussians=gaussians,
                     scene=scene,
-                    pipe=pipe,
-                    background=background,
                     stage=stage,
-                    num_cameras=5
+                    gt_pointcloud_cache=gt_pointcloud_cache,
+                    prune_percent=0.20,  # Remove worst 20% of dynamic Gaussians
+                    num_time_samples=5    # Use 5 cameras near t=0
                 )
-                print("="*80 + "\n")
+                
+                # Alternative: Use adaptive threshold-based pruning instead
+                # prune_high_chamfer_dynamic_gaussians_adaptive(
+                #     gaussians=gaussians,
+                #     scene=scene,
+                #     stage=stage,
+                #     gt_pointcloud_cache=gt_pointcloud_cache,
+                #     distance_threshold=0.05,  # Remove Gaussians >5cm from GT
+                #     num_time_samples=5
+                # )
 
                 # Optimizer step
             if iteration < train_iter:
@@ -855,14 +950,6 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
         # Initialize dynamic gaussians in the model
         gaussians.spawn_dynamic_gaussians(random_init = False, precomputed_positions = list(scene.getTrainCameras())[1].backproject_mask_to_world())
         
-        # FREEZE dynamic XYZ positions: We want the deformation network to learn temporal motion,
-        # NOT to change the initialization. The spawn positions are perfect, so keep them fixed.
-        if hasattr(gaussians, '_dynamic_xyz'):
-            dynamic_mask = gaussians._dynamic_xyz
-            gaussians._xyz.data[dynamic_mask].requires_grad = False
-            print(f"✓ FROZEN dynamic Gaussian XYZ positions ({dynamic_mask.sum().item()} points)")
-            print(f"  → Only deformation network will learn motion from t=0 position")
-        
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
                                 gaussians, scene, "dynamics_depth", tb_writer, using_wandb, training_iters[2], timer, first_iters[2])
@@ -875,9 +962,6 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
                                 gaussians, scene, "dynamics_RGB", tb_writer, using_wandb, training_iters[3], timer, first_iters[3])
         render_set_no_compression(dataset.model_path, "dynamics_RGB_render", total_iters, scene.getTrainCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=False)
         current_stage = stages[4]
-
-    # No fine stage, just end the experiment
-    if training_iters[4] == 0: return
 
 
     if  current_stage == stages[4]:

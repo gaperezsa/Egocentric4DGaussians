@@ -89,9 +89,8 @@ class Deformation(nn.Module):
         if self.no_grid:
             h = torch.cat([rays_pts_emb[:,:3],time_emb[:,:1]],-1)
         else:
-
             grid_feature = self.grid(rays_pts_emb[:,:3], time_emb[:,:1])
-            # breakpoint()
+            
             if self.grid_pe > 1:
                 grid_feature = poc_fre(grid_feature,self.grid_pe)
             hidden = torch.cat([grid_feature],-1) 

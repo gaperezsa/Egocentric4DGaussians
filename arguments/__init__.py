@@ -114,6 +114,9 @@ class ModelHiddenParams(ParamGroup):
         self.normal_tv_weight = 0.01  # Weight for normal TV smoothness term
         self.ssim_weight = 0.0  # Weight for SSIM loss (fine_coloring stage, 0 = disabled)
         self.plane_tv_weight = 0.0001  # Weight for space-time TV regularization (coherence)
+        
+        # Visualization flags
+        self.aria_rotated = False  # Rotate training visualizations 90° CW for raw Aria orientation data
 
         
         super().__init__(parser, "ModelHiddenParams")
@@ -172,6 +175,16 @@ class OptimizationParams(ParamGroup):
         # ========== Batch & Point Management ==========
         self.batch_size = 1
         self.add_point = False
+        
+        # ========== NEW: Time-Aware Depth Error Pruning ==========
+        # Depth error threshold for blame assignment (applies to all stages during rendering)
+        self.depth_error_threshold_cm = 10.0  # Pixels with >10cm error are considered "bad"
+        
+        # Stage-specific pruning thresholds (mean error to trigger pruning)
+        self.static_depth_error_threshold_cm = 15.0   # Static stages: strict (background should be accurate)
+        self.dynamic_depth_error_threshold_cm = 20.0  # Dynamic stage: looser (motion is harder)
+        self.fine_depth_error_threshold_cm = 10.0     # Fine stage: strictest (final refinement)
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

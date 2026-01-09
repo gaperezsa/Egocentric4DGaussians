@@ -11,7 +11,7 @@ def create_video_from_png(folder_path, output_video_path):
     # Print folder name being processed
     print(f"Processing folder: {folder_path}")
     # Search for .png files in the folder
-    png_files = glob.glob(os.path.join(folder_path, '*.png'))
+    png_files = glob.glob(os.path.join(folder_path, '*.jpg'))
     # Sort the list of file paths
     sorted_files = sorted(png_files)
 
@@ -56,6 +56,6 @@ def numerical_sort_key(s):
 if __name__ == "__main__":
     
 
-    folder_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/entire_sequence_rendered_depth"
-    output_video_path = "/shared/home/gperezsantamaria/EgoGaussian/EgoGaussian-output/HOI/Video2/full/entire_sequence_rendered_depth/EgoGaussian_video_2_colored_rendered_depth.mp4"
+    folder_path = "/home/gperezsantamaria/sda_data/Egocentric4DGaussians/output/recognition_inital_debug/background_depth_train_render/images"
+    output_video_path = "/home/gperezsantamaria/sda_data/Egocentric4DGaussians/output/recognition_inital_debug/background_depth_train_render/depth_training_video.mp4"
     create_video_from_png(folder_path, output_video_path)
