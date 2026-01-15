@@ -108,6 +108,7 @@ def _collect_true_depth_sources(root: Path) -> Tuple[str, List[Path]]:
       root/depth_video.avi
       root/frames/*.png
       root/tensors/*.pt or *.npy
+      root/*.png (direct depth files)
     """
     avi = root / "depth_video.avi"
     if avi.is_file():
@@ -124,6 +125,11 @@ def _collect_true_depth_sources(root: Path) -> Tuple[str, List[Path]]:
         tens = sorted([p for p in tens_dir.iterdir() if p.suffix.lower() in (".pt", ".npy")])
         if tens:
             return "tensors", tens
+
+    # Check for PNG files directly in root (e.g., camera_depth_*.png)
+    pngs = sorted([p for p in root.iterdir() if p.suffix.lower() == ".png"])
+    if pngs:
+        return "pngs", pngs
 
     return "none", []
 
@@ -216,32 +222,48 @@ def ensure_true_depth_gt(
             # fallback: load all frames (NOTE: may not be correct for 16-bit depth AVIs)
             avi_frames = _load_all_frames_from_avi(avi_path)
 
-    # map index->source item
-    idx2src = {}
+    # map timestamp/ID -> source item (filename-based for better matching)
+    id2src = {}
     if mode == "pngs":
-        for i, p in enumerate(sources):
-            idx2src[i] = p
+        for p in sources:
+            # Extract ID from filename: camera_depth_74876425582900.png -> 74876425582900
+            stem = p.stem  # e.g. "camera_depth_74876425582900"
+            m = re.search(r'(\d+)$', stem)  # get last number sequence
+            if m:
+                file_id = m.group(1)
+                id2src[file_id] = p
     elif mode == "tensors":
-        for i, p in enumerate(sources):
-            idx2src[i] = p
+        for p in sources:
+            stem = p.stem
+            m = re.search(r'(\d+)$', stem)
+            if m:
+                file_id = m.group(1)
+                id2src[file_id] = p
     elif mode == "avi" and avi_frames is not None:
+        # For AVI, use sequential indexing (no ID available)
         for i in range(len(avi_frames)):
-            idx2src[i] = i  # store the int index, we pull from avi_frames list
+            id2src[str(i)] = i
 
     # build outputs
     W, H = target_size
     for name in image_names:
-        idx = _extract_frame_index(name)
-        if idx is None or idx not in idx2src:
-            # no matching true depth frame; skip
-            continue
+        # name is like "74876425582900" - try to match directly
+        if name in id2src:
+            src = id2src[name]
+        else:
+            # fallback: try extracting last number sequence from name
+            idx = _extract_frame_index(name)
+            if idx is None or str(idx) not in id2src:
+                # no matching true depth frame; skip
+                continue
+            src = id2src[str(idx)]
 
         if mode == "pngs":
-            arr = np.array(Image.open(idx2src[idx]), dtype=np.float32)
+            arr = np.array(Image.open(src), dtype=np.float32)
         elif mode == "tensors":
-            arr = _load_tensor(idx2src[idx])
+            arr = _load_tensor(src)
         elif mode == "avi":
-            arr = avi_frames[idx]
+            arr = avi_frames[src]
         else:
             continue
 

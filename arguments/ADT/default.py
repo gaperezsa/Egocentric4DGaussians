@@ -10,8 +10,8 @@ ModelHiddenParams = dict(
     net_width = 128,
     # ========== Loss Weights (DN-Splatter & Depth) ==========
     general_depth_weight = 1,           # Depth supervision (all depth stages)
-    rgb_weight = 30.0,                      # RGB supervision weight
-    chamfer_weight = 200.0,                 # Chamfer distance (dynamic objects)
+    rgb_weight = 50.0,                      # RGB supervision weight
+    chamfer_weight = 1.0,                 # Chamfer distance (dynamic objects)
     normal_loss_weight = 0.5,             # Normal regularization (geometric)
     scale_loss_weight = 100.0,               # Scale regularization (disk like encouraging)
     ssim_weight = 0.1,                     # SSIM loss (fine_coloring)
@@ -43,16 +43,19 @@ OptimizationParams = dict(
     deformation_lr_final = 0.0000016,
     
     # ========== Densification & Pruning Strategy ==========
+    densify_from_iter = 500,
     densification_interval = 200,
-    pruning_interval = 700,
+    pruning_interval = 400,
     densify_until_iter = 5_000,
-    opacity_reset_interval = 30000,
-    scale_pruning_factor = 1.0
+    opacity_reset_interval = 2100,
+    scale_pruning_factor = 1.0,
+    depth_error_threshold_cm = 20.0,  # Pixels with >20cm error are considered "bad"
+    depth_blame_percent = 0.1,  # Fraction of pixels to blame based on depth error
     # dataloader=True,
     # coarse_iterations = 3000,
     # grid_lr_init = 0.0016,
     # grid_lr_final = 16,
-    # opacity_threshold_coarse = 0.005,
+    opacity_threshold_coarse = 0.1,
     # opacity_threshold_fine_init = 0.005,
     # opacity_threshold_fine_after = 0.005,
 )

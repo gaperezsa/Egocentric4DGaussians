@@ -191,7 +191,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # time3 = get_time()
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, radii, depth, gaussian_idx = rasterizer(
         means3D = means3D_final,
         means2D = means2D,
         shs = shs_final,
@@ -308,7 +308,7 @@ def render_dynamic_compare(viewpoint_camera, pc : GaussianModel, pipe, bg_color 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # time3 = get_time()
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, radii, depth, gaussian_idx = rasterizer(
         means3D = means3D_final,
         means2D = means2D,
         shs = shs_final,
@@ -506,7 +506,7 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
                 dynamic_masked_cov3D_precomp = None
                 non_dynamic_masked_cov3D_precomp = None
 
-            dynamic_only_splat, dynamic_only_radii, dynamic_only_depth = rasterizer(
+            dynamic_only_splat, dynamic_only_radii, dynamic_only_depth, gaussian_idx = rasterizer(
                 means3D = means3D_final[dynamic_gaussians_mask],
                 means2D = means2D[dynamic_gaussians_mask],
                 shs = shs_final[dynamic_gaussians_mask],
@@ -516,7 +516,7 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
                 rotations = rotations_final[dynamic_gaussians_mask],
                 cov3D_precomp = dynamic_masked_cov3D_precomp)
             
-            static_only_splat, static_only_radii, static_only_depth = rasterizer(
+            static_only_splat, static_only_radii, static_only_depth, gaussian_idx = rasterizer(
                 means3D = means3D_final[~dynamic_gaussians_mask],
                 means2D = means2D[~dynamic_gaussians_mask],
                 shs = shs_final[~dynamic_gaussians_mask],
@@ -530,7 +530,7 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
 
         # if there arent, the static only ones *are* the scene
         else:
-            static_only_splat, static_only_radii, static_only_depth = rasterizer(
+            static_only_splat, static_only_radii, static_only_depth, gaussian_idx = rasterizer(
                 means3D = means3D_final,
                 means2D = means2D,
                 shs = shs_final,
@@ -539,11 +539,11 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
                 scales = scales_final,
                 rotations = rotations_final,
                 cov3D_precomp = cov3D_precomp)
-            rendered_image, radii, depth = static_only_splat, static_only_radii, static_only_depth
+            rendered_image, radii, depth, gaussian_idx = static_only_splat, static_only_radii, static_only_depth, gaussian_idx
 
     # If we are not training or in the last fine stage, the entire scene is returned
     else:
-        rendered_image, radii, depth = rasterizer(
+        rendered_image, radii, depth, gaussian_idx = rasterizer(
             means3D = means3D_final,
             means2D = means2D,
             shs = shs_final,
@@ -644,7 +644,8 @@ def render_with_dynamic_gaussians_mask(viewpoint_camera, pc : GaussianModel, pip
             "dynamic_only_radii": dynamic_only_radii,
             "dynamic_only_depth": dynamic_only_depth,
             "dynamic_3D_means": means3D_final[dynamic_gaussians_mask],
-            "normal_map": normal_map  # NEW: Rendered normal map [3, H, W] or None
+            "normal_map": normal_map,  # Rendered normal map [3, H, W] or None
+            "gaussian_idx": gaussian_idx # Pixel to most contributing gaussian index map
             }
 
 
@@ -774,7 +775,7 @@ def render_dynamic_gaussians_mask_and_compare(viewpoint_camera, pc : GaussianMod
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # time3 = get_time()
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, radii, depth, gaussian_idx = rasterizer(
         means3D = means3D_final,
         means2D = means2D,
         shs = shs_final,

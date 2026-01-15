@@ -44,7 +44,7 @@ def l1_background_colored_masked_loss(network_output, gt, mask, background_color
     '''
     # Converting to tensor of broadcastable dimension and replacing outside the mask with background color
     backgrounded_image = torch.where(mask, gt, background_color.view(1,3,1,1))
-    return torch.abs((network_output - backgrounded_image)).sum()
+    return torch.abs((network_output - backgrounded_image)).mean()
 
 def l1_filtered_depth_valid_loss(network_output, gt, filter):
     valid_depth = gt > 0.001
@@ -134,6 +134,11 @@ def chamfer_loss_naive(pred_list, gt_list, eps=1e-8):
         if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
             raise ValueError("Each ground-truth point set must have shape (N, 3)")
         
+        # Handle empty point clouds (frames with no dynamic mask pixels)
+        if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
+            # Skip this frame - return 0 loss
+            continue
+        
         # Compute pairwise distances (squared) between predicted and ground-truth points.
         # Using torch.cdist for efficient pairwise distance computation.
         dist_matrix = torch.cdist(pred_pts, gt_pts, p=2).pow(2)  # shape (M, N)
@@ -147,6 +152,10 @@ def chamfer_loss_naive(pred_list, gt_list, eps=1e-8):
         loss_gt = torch.sqrt(min_dist_sq_gt + eps).mean()
         
         chamfer_losses.append(loss_pred + loss_gt)
+    
+    # Handle case where all frames had empty point clouds
+    if len(chamfer_losses) == 0:
+        return torch.tensor(0.0, device=pred_list[0].device if len(pred_list) > 0 else 'cuda')
     
     # Return the average Chamfer distance over the batch.
     return torch.stack(chamfer_losses).mean()
@@ -177,6 +186,11 @@ def chamfer_loss_optimized(pred_list, gt_list, eps=1e-8):
         if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
             raise ValueError("Each ground-truth point set must have shape (N, 3)")
         
+        # Handle empty point clouds (frames with no dynamic mask pixels)
+        if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
+            # Skip this frame - return 0 loss
+            continue
+        
         # For each predicted point, find nearest ground-truth point
         # Compute squared L2 distance: ||pred - gt||^2 = sum((pred - gt)^2)
         # Using broadcasting: (M,1,3) - (1,N,3) -> (M,N,3) -> (M,N)
@@ -195,6 +209,11 @@ def chamfer_loss_optimized(pred_list, gt_list, eps=1e-8):
         loss_gt = torch.sqrt(min_dist_sq_gt + eps).mean()
         
         chamfer_losses.append(loss_pred + loss_gt)
+    
+    # Handle case where all frames had empty point clouds
+    if len(chamfer_losses) == 0:
+        # Return zero loss (no dynamic content to supervise)
+        return torch.tensor(0.0, device=pred_list[0].device if len(pred_list) > 0 else 'cuda')
     
     # Return the average Chamfer distance over the batch.
     return torch.stack(chamfer_losses).mean()
@@ -231,6 +250,10 @@ def chamfer_with_median_naive(pred_list, gt_list, eps=1e-8):
         if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
             raise ValueError("Each GT set must have shape (N,3)")
 
+        # Handle empty point clouds (frames with no dynamic mask pixels)
+        if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
+            continue
+
         # 1) Compute squared pairwise distances [M×N]
         dist_matrix = torch.cdist(pred_pts, gt_pts, p=2).pow(2)  # [M,N]
 
@@ -247,12 +270,19 @@ def chamfer_with_median_naive(pred_list, gt_list, eps=1e-8):
         loss_gt   = torch.sqrt(min_dist_sq_gt + eps).mean()
         chamfer_losses.append(loss_pred + loss_gt)
 
+    # Handle empty case
+    if len(chamfer_losses) == 0:
+        return torch.tensor(0.0, device=pred_list[0].device if len(pred_list) > 0 else 'cuda'), 0.0
+
     # 5) Combine batch‐loss
     loss = torch.stack(chamfer_losses).mean()
 
     # 6) Flatten all "pred→gt" distances into one big vector, then median
-    all_min_dists = torch.cat(all_min_dists, dim=0)  # length = total #pred‐points
-    median_dist = torch.median(all_min_dists).item() # scalar float
+    if len(all_min_dists) > 0:
+        all_min_dists = torch.cat(all_min_dists, dim=0)  # length = total #pred‐points
+        median_dist = torch.median(all_min_dists).item() # scalar float
+    else:
+        median_dist = 0.0
 
     return loss, median_dist
 
@@ -269,6 +299,10 @@ def chamfer_with_median_optimized(pred_list, gt_list, eps=1e-8):
             raise ValueError("Each predicted set must have shape (M,3)")
         if gt_pts.ndim != 2 or gt_pts.shape[1] != 3:
             raise ValueError("Each GT set must have shape (N,3)")
+
+        # Handle empty point clouds (frames with no dynamic mask pixels)
+        if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
+            continue
 
         # Compute squared distances using broadcasting
         pred_expanded = pred_pts.unsqueeze(1)  # (M, 1, 3)
@@ -287,12 +321,19 @@ def chamfer_with_median_optimized(pred_list, gt_list, eps=1e-8):
         loss_gt   = torch.sqrt(min_dist_sq_gt + eps).mean()
         chamfer_losses.append(loss_pred + loss_gt)
 
+    # Handle empty case
+    if len(chamfer_losses) == 0:
+        return torch.tensor(0.0, device=pred_list[0].device if len(pred_list) > 0 else 'cuda'), 0.0
+
     # Combine batch loss
     loss = torch.stack(chamfer_losses).mean()
 
     # Compute median
-    all_min_dists = torch.cat(all_min_dists, dim=0)
-    median_dist = torch.median(all_min_dists).item()
+    if len(all_min_dists) > 0:
+        all_min_dists = torch.cat(all_min_dists, dim=0)
+        median_dist = torch.median(all_min_dists).item()
+    else:
+        median_dist = 0.0
 
     return loss, median_dist
 

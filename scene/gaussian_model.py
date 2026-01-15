@@ -67,8 +67,6 @@ class GaussianModel:
         # NEW: Temporal depth error tracking (replaces depth_outlier_hits)
         self._depth_error_sum = torch.empty(0)      # Accumulated error magnitude (meters)
         self._depth_error_count = torch.empty(0)    # Number of times blamed
-        self._depth_error_max = torch.empty(0)      # Worst single error seen
-        self._birth_iteration = torch.empty(0)      # When this Gaussian was created (for fair pruning)
         
         self.optimizer = None
         self.percent_dense = 0
@@ -96,8 +94,6 @@ class GaussianModel:
             self.denom,
             self._depth_error_sum,
             self._depth_error_count,
-            self._depth_error_max,
-            self._birth_iteration,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -120,8 +116,6 @@ class GaussianModel:
         denom,
         depth_error_sum,
         depth_error_count,
-        depth_error_max,
-        birth_iteration,
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self._deformation.load_state_dict(deform_state)
@@ -131,8 +125,6 @@ class GaussianModel:
             self.denom = denom
             self._depth_error_sum = depth_error_sum
             self._depth_error_count = depth_error_count
-            self._depth_error_max = depth_error_max
-            self._birth_iteration = birth_iteration
             self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -212,8 +204,16 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.depth_outlier_hits = torch.zeros((self.get_xyz.shape[0],1), dtype=torch.int64, device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
+        
+        # Initialize depth-based blame tracking tensors (mean error = sum / count)
+        self._depth_error_sum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._depth_error_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        
         self._lr_static  = training_args.static_position_lr_init*self.spatial_lr_scale
         self._lr_dynamic = training_args.dynamic_position_lr_init*self.spatial_lr_scale
+        
+        # Default: don't freeze static gaussians (only freeze during dynamics_RGB and fine_coloring)
+        self._freeze_static = False
         
         # Save existing optimizer state BEFORE recreating
         old_optimizer_state = None
@@ -381,6 +381,15 @@ class GaussianModel:
             N = self._xyz.shape[0]
             assert self._dynamic_xyz.shape[0] == N, \
                 f"dynamic mask ({self._dynamic_xyz.shape[0]}) ≠ xyz ({N})"
+
+            # FREEZE STATIC GAUSSIANS: Create a mask to completely freeze background during RGB refinement
+            # This prevents static gaussians from getting gradients or being densified/pruned
+            num_static = (~self._dynamic_xyz).sum().item()
+            num_dynamic = self._dynamic_xyz.sum().item()
+            print(f"[STAGE={stage}] Freezing {num_static} static Gaussians (keeping {num_dynamic} dynamic active)")
+            
+            # Mark that we're freezing static gaussians (checked in grow/prune)
+            self._freeze_static = True
 
             # Register hook
             self._xyz.register_hook(_dynamic_grad_hook)
@@ -569,6 +578,17 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
+    def reset_opacity_dynamic(self):
+        """Reset opacity only for dynamic Gaussians, leaving static ones unchanged."""
+        # Only reset opacity where _dynamic_xyz is True
+        opacities_new = self._opacity.clone()
+        dynamic_mask = self._dynamic_xyz
+        opacities_new[dynamic_mask] = inv_steep_sigmoid(
+            torch.min(self.get_opacity[dynamic_mask], torch.ones_like(self.get_opacity[dynamic_mask])*0.01)
+        )
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
@@ -693,11 +713,9 @@ class GaussianModel:
         self._deformation_accum = torch.zeros((n,3), device=self._xyz.device)
         self.denom              = torch.zeros((n,1), device=self._xyz.device)
         
-        # NEW: Reset depth error stats (but preserve what remains after pruning)
+        # NEW: Preserve depth error stats after pruning
         self._depth_error_sum = self._depth_error_sum[valid]
         self._depth_error_count = self._depth_error_count[valid]
-        self._depth_error_max = self._depth_error_max[valid]
-        self._birth_iteration = self._birth_iteration[valid]
         
         self.max_radii2D        = torch.zeros((n,),  device=self._xyz.device)
 
@@ -825,15 +843,6 @@ class GaussianModel:
             self._depth_error_count,
             torch.zeros((M,1), device=dev)
         ], dim=0)
-        self._depth_error_max = torch.cat([
-            self._depth_error_max,
-            torch.zeros((M,1), device=dev)
-        ], dim=0)
-        # Birth iteration will be set by set_birth_iteration() call after this
-        self._birth_iteration = torch.cat([
-            self._birth_iteration,
-            torch.zeros((M,1), dtype=torch.int32, device=dev)
-        ], dim=0)
         
         self.max_radii2D      = torch.cat([
             self.max_radii2D,
@@ -854,7 +863,7 @@ class GaussianModel:
 
 
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, percentage_of_train_stage_remaining = 1):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3, percentage_of_train_stage_remaining = 1):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -868,7 +877,7 @@ class GaussianModel:
             return
         
         #factor for more local splitting
-        stds = (0.1 * percentage_of_train_stage_remaining) * self.get_scaling[selected_pts_mask].repeat(N,1)
+        stds = (0.4 * percentage_of_train_stage_remaining) * self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
@@ -919,7 +928,7 @@ class GaussianModel:
         grads: torch.Tensor,
         grad_threshold: float,
         scene_extent: float,
-        N: int = 2,
+        N: int = 3,
         median_dist: float = 0.1,
         percentage_of_train_stage_remaining: float = 1.0
     ):
@@ -962,7 +971,7 @@ class GaussianModel:
 
         # 4) Local-frame sampling stds (anisotropic): factor * parent_scale
         #    Repeat for N children per parent
-        stds_local = ((0.1 * percentage_of_train_stage_remaining)  * parent_scale).repeat_interleave(N, dim=0)  # [K*N, 3]
+        stds_local = ((0.4 * percentage_of_train_stage_remaining)  * parent_scale).repeat_interleave(N, dim=0)  # [K*N, 3]
         means_local = torch.zeros_like(stds_local, device=device)
 
         # 5) Sample local offsets and rotate into world frame
@@ -977,13 +986,10 @@ class GaussianModel:
         world_offsets = torch.bmm(rots, local_offsets.unsqueeze(-1)).squeeze(-1)  # [K*N, 3]
         candidate_xyz = centers + world_offsets                             # [K*N, 3]
 
-        # 6) Chamfer-based culling: drop children too far from parent (> median_dist)
-        if median_dist <= 1e-9:
-            return
-        dists = torch.norm(world_offsets, dim=1)                            # [K*N]
-        keep = (dists <= median_dist)
-        if not keep.any():
-            return
+        # 6) Keep all children - no Chamfer-based culling
+        # (Quality filtering happens via pruning with depth blame scores instead)
+        # median_dist=0.0 signals "no culling" - keep all split children
+        keep = torch.ones(candidate_xyz.shape[0], dtype=torch.bool, device=device)
 
         new_xyz      = candidate_xyz[keep]                                  # [M, 3]
         new_dynamic  = torch.ones(keep.sum(), dtype=torch.bool, device=device)
@@ -1212,6 +1218,19 @@ class GaussianModel:
         flag = False
         point_cloud = self.get_xyz.detach().cpu()
         point_downsample = point_cloud.detach()
+        
+        # RESPECT STATIC FREEZE: If we're freezing static gaussians, only consider dynamic ones
+        if hasattr(self, '_freeze_static') and self._freeze_static:
+            # Only densify dynamic gaussians during dynamics_RGB/fine_coloring
+            dynamic_mask = self._dynamic_xyz.cpu()
+            if dynamic_mask.sum() == 0:
+                print("No dynamic gaussians to densify (all static frozen)")
+                return
+            point_downsample = point_cloud[dynamic_mask]
+            if point_downsample.shape[0] == 0:
+                print("No dynamic gaussians available for densification")
+                return
+        
         downsampled_point_index = self.downsample_point(point_downsample)
 
 
@@ -1227,7 +1246,13 @@ class GaussianModel:
         global_mask = torch.zeros((point_cloud.shape[0]), dtype=torch.bool)
 
         global_mask[downsampled_point_index] = low_density_index
-        global_mask
+        
+        # RESPECT STATIC FREEZE: Further filter the mask to only include dynamic gaussians
+        if hasattr(self, '_freeze_static') and self._freeze_static:
+            static_mask = ~self._dynamic_xyz.cpu()
+            global_mask[static_mask] = False  # Never densify static gaussians
+            num_to_add = global_mask.sum()
+        
         selected_xyz, new_xyz = self.add_point_by_mask(global_mask.to(self.get_xyz.device), self.displacement_scale)
         print("point growing,add point num:",global_mask.sum())
         if model_path is not None and iteration is not None:
@@ -1241,23 +1266,43 @@ class GaussianModel:
         min_opacity,
         max_scale,
         max_screen_size,
-        max_outlier_hits: int = None):
+        max_outlier_hits: int = None,
+        depth_blame_percent: float = None):
         """
-        Compute exactly the same boolean mask that prune() would use,
-        but *don’t* actually remove the Gaussians yet.
+        Compute exactly the same boolean mask that prune() would use.
         Returns a torch.BoolTensor of shape [N].
+        
+        Args:
+            depth_blame_percent: If set, prune this fraction of Gaussians with highest blame scores
         """
-        # opacity & size gates
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > max_scale
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
-        # new outlier-hit gate
         if max_outlier_hits is not None:
             mask_bad = (self.depth_outlier_hits.squeeze() > max_outlier_hits)
             prune_mask = torch.logical_or(prune_mask, mask_bad)
+        
+        if depth_blame_percent is not None and depth_blame_percent > 0:
+            top_indices, top_scores = self.get_most_blamed_gaussians(topk_percent=depth_blame_percent)
+            if top_indices.numel() > 0:
+                blame_mask = torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
+                blame_mask[top_indices] = True
+                prune_mask = torch.logical_or(prune_mask, blame_mask)
+                print(f"[PRUNE] Removing {top_indices.numel()} Gaussians with highest blame scores")
+                print(f"  Top blame score: {top_scores[0].item():.6f}")
+                print(f"  Min blame score (of top {depth_blame_percent*100:.1f}%): {top_scores[-1].item():.6f}")
+            else:
+                print(f"[PRUNE] No blamed Gaussians to prune (depth_blame_percent={depth_blame_percent})")
+        
+        # RESPECT STATIC FREEZE: Never prune static gaussians during dynamics_RGB/fine_coloring
+        if hasattr(self, '_freeze_static') and self._freeze_static:
+            static_mask = ~self._dynamic_xyz
+            prune_mask[static_mask] = False  # Protect static gaussians from pruning
+            num_to_prune = prune_mask.sum().item()
+            print(f"[PRUNE] Pruning ONLY dynamic gaussians: {num_to_prune} candidates (static protected)")
         
         return prune_mask
 
@@ -1266,15 +1311,12 @@ class GaussianModel:
         min_opacity,
         max_scale,
         max_screen_size,
-        depth_error_threshold_cm: float = None,
-        min_depth_observations: int = 5,
-        current_iteration: int = 0,
-        min_iterations_alive: int = 100):
+        depth_blame_percent: float = 0.1):
         
         prune_mask = self.compute_prune_mask(
             min_opacity, max_scale, max_screen_size,
-            depth_error_threshold_cm, min_depth_observations,
-            current_iteration, min_iterations_alive
+            max_outlier_hits=None,
+            depth_blame_percent=depth_blame_percent
         )
 
         self.prune_points(prune_mask)
@@ -1321,6 +1363,7 @@ class GaussianModel:
     def update_depth_error_stats(self, gaussian_indices, error_magnitudes):
         """
         Accumulate depth error statistics for Gaussians that contributed to bad pixels.
+        Uses mean error (sum / count) as the blame score.
         
         Args:
             gaussian_indices: [M] tensor of Gaussian indices to blame
@@ -1329,41 +1372,90 @@ class GaussianModel:
         if gaussian_indices.numel() == 0:
             return
         
+        # Ensure all tensors are on the same device (CUDA if available)
+        device = error_magnitudes.device
+        gaussian_indices = gaussian_indices.to(device).long()
+        error_magnitudes = error_magnitudes.to(device)
+        
+        # Move accumulator tensors to the same device if needed
+        self._depth_error_sum = self._depth_error_sum.to(device)
+        self._depth_error_count = self._depth_error_count.to(device)
+        
         # Accumulate error sum
         self._depth_error_sum.index_add_(0, gaussian_indices, error_magnitudes.unsqueeze(-1))
         
         # Increment blame count
-        ones = torch.ones_like(error_magnitudes, dtype=self._depth_error_count.dtype).unsqueeze(-1)
+        ones = torch.ones_like(error_magnitudes).unsqueeze(-1)
         self._depth_error_count.index_add_(0, gaussian_indices, ones)
+    
+    def compute_depth_blame_score(self):
+        """
+        Compute a unified "blame score" for each Gaussian based on accumulated depth errors.
         
-        # Update max error seen
-        for idx, err in zip(gaussian_indices, error_magnitudes):
-            current_max = self._depth_error_max[idx, 0]
-            if err > current_max:
-                self._depth_error_max[idx, 0] = err
+        Strategy: Use mean error to balance catastrophic errors (high) vs. consistent errors.
+        - High error but rare → high mean → prioritize for pruning
+        - Small consistent errors → low mean → keep it
+        
+        Formula: blame_score = error_sum / count
+        Returns mean error in meters for each Gaussian.
+        
+        Returns:
+            torch.Tensor [N, 1]: Mean blame score for each Gaussian (0 if never blamed)
+        """
+        # Avoid division by zero
+        epsilon = 1
+        count = self._depth_error_count + epsilon
+        
+        # Mean error across all blamed instances
+        blame_score = self._depth_error_sum / count
+        
+        return blame_score
+    
+    def get_most_blamed_gaussians(self, topk_percent=0.1):
+        """
+        Get indices of the most blamed Gaussians (ordered by blame score).
+        Only considers Gaussians with blame_score > 0 (i.e., blamed at least once).
+        
+        Args:
+            topk_percent: Fraction of BLAMED Gaussians to return (0.1 = top 10% of blamed set)
+        
+        Returns:
+            torch.Tensor: Indices of worst Gaussians, sorted by blame score (highest first)
+            torch.Tensor: Corresponding blame scores
+            Returns empty tensors if no Gaussians have been blamed
+        """
+        blame_scores = self.compute_depth_blame_score().squeeze(-1)  # [N]
+        
+        # Find Gaussians that have been blamed (score > 0)
+        blamed_mask = blame_scores > 0
+        if blamed_mask.sum() == 0:
+            # No Gaussians blamed, don't prune anything
+            return torch.empty(0, dtype=torch.int64, device=self._xyz.device), \
+                   torch.empty(0, dtype=torch.float32, device=self._xyz.device)
+        
+        # Get indices and scores of only blamed Gaussians
+        blamed_indices = torch.where(blamed_mask)[0]
+        blamed_scores = blame_scores[blamed_mask]
+        
+        # Get top K from only the blamed set
+        k = max(1, int(blamed_indices.shape[0] * topk_percent))
+        top_blamed_scores, top_blamed_positions = torch.topk(blamed_scores, k, largest=True)
+        
+        # Map back to original indices
+        top_indices = blamed_indices[top_blamed_positions]
+        
+        return top_indices, top_blamed_scores
     
     def reset_depth_error_stats(self):
         """Reset depth error accumulators (called at pruning iterations and stage transitions)"""
         self._depth_error_sum.zero_()
         self._depth_error_count.zero_()
-        self._depth_error_max.zero_()
     
     def reset_densification_stats(self):
         """Reset gradient-based densification accumulators (called at stage transitions)"""
         self.xyz_gradient_accum.zero_()
         self.denom.zero_()
     
-    def set_birth_iteration(self, start_idx, end_idx, iteration):
-        """
-        Set birth iteration for newly created Gaussians.
-        
-        Args:
-            start_idx: Starting index of new Gaussians
-            end_idx: Ending index (exclusive)
-            iteration: Current training iteration
-        """
-        self._birth_iteration[start_idx:end_idx] = iteration
-
     @torch.no_grad()
     def find_outlier_gaussians_and_update_hits(
         self,

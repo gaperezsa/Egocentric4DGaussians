@@ -179,11 +179,7 @@ class OptimizationParams(ParamGroup):
         # ========== NEW: Time-Aware Depth Error Pruning ==========
         # Depth error threshold for blame assignment (applies to all stages during rendering)
         self.depth_error_threshold_cm = 10.0  # Pixels with >10cm error are considered "bad"
-        
-        # Stage-specific pruning thresholds (mean error to trigger pruning)
-        self.static_depth_error_threshold_cm = 15.0   # Static stages: strict (background should be accurate)
-        self.dynamic_depth_error_threshold_cm = 20.0  # Dynamic stage: looser (motion is harder)
-        self.fine_depth_error_threshold_cm = 10.0     # Fine stage: strictest (final refinement)
+        self.depth_blame_percent = 0.1  # Fraction of pixels to blame based on depth error
         
         super().__init__(parser, "Optimization Parameters")
 

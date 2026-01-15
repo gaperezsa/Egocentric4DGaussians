@@ -24,6 +24,6 @@ python train_dynamic_depth.py \
   --chamfer_weight 1.0 \
   --plane_tv_weight 0.001 \
   --configs "arguments/ADT/default.py" \
-  --port 6262 \
-  --expname recognition_v2 \
-  --source_path "data/ADT/recognitionV2/colmap" \
+  --port 6263 \
+  --expname work_v2 \
+  --source_path "data/ADT/workV2/colmap" \

@@ -245,9 +245,16 @@ def evaluate_single_folder(folder_path: str, crop_px: int = 5, suffix: str = "cr
         mse_vals, rmse_vals = [], []
         mse_per, rmse_per = {}, {}
         depth_names = sorted([f for f in os.listdir(depth_pred_dir) if f.lower().endswith(".pt")])
+        matched_count = 0
         for fname in tqdm(depth_names, desc=f"Depth metrics (crop {crop_px}px)"):
+            # Only compute metrics if BOTH predicted AND GT depth exist for this frame
+            # This gracefully skips renders without corresponding sparse GT depth
+            gt_path = depth_gt_dir / fname
+            if not gt_path.exists():
+                continue  # Skip this frame; no sparse GT depth available
+            
             pr_t = torch.load(depth_pred_dir / fname).to(torch.float32)
-            gt_t = torch.load(depth_gt_dir / fname).to(torch.float32)
+            gt_t = torch.load(gt_path).to(torch.float32)
             while pr_t.dim() > 2: pr_t = pr_t.squeeze(0)
             while gt_t.dim() > 2: gt_t = gt_t.squeeze(0)
             H = min(pr_t.shape[0], gt_t.shape[0]); W = min(pr_t.shape[1], gt_t.shape[1])
@@ -255,6 +262,8 @@ def evaluate_single_folder(folder_path: str, crop_px: int = 5, suffix: str = "cr
             pr_t = _crop_tensor_2d(pr_t, crop_px); gt_t = _crop_tensor_2d(gt_t, crop_px)
             valid = (gt_t > 0).to(torch.float32); n = valid.sum()
             if n <= 0: continue
+            
+            matched_count += 1
             err = (pr_t - gt_t)
             mse = ((err**2) * valid).sum() / n
             rmse = torch.sqrt(torch.clamp(mse, min=0.0))
@@ -272,6 +281,9 @@ def evaluate_single_folder(folder_path: str, crop_px: int = 5, suffix: str = "cr
                 "Depth MSE": mse_per,
                 "Depth RMSE": rmse_per
             })
+            print(f"[metrics] Computed depth metrics on {matched_count}/{len(depth_names)} frames with sparse GT depth")
+        else:
+            print(f"[metrics] No frames with valid sparse GT depth found ({matched_count}/{len(depth_names)} matched but all had invalid GT)")
     else:
         print("[metrics] depth_gt_tensors or depth_renders_tensors missing; depth metrics skipped.")
 

@@ -1,3 +1,23 @@
+def zero_static_gaussian_grads(gaussians):
+    """
+    Zero out gradients for all static (background) gaussians.
+    Call this after backward() and before optimizer.step() if static freezing is enabled.
+    """
+    if not (hasattr(gaussians, '_freeze_static') and gaussians._freeze_static):
+        return
+    static_mask = ~gaussians._dynamic_xyz
+    if gaussians._xyz.grad is not None:
+        gaussians._xyz.grad[static_mask] = 0.0
+    if gaussians._features_dc.grad is not None:
+        gaussians._features_dc.grad[static_mask] = 0.0
+    if gaussians._features_rest.grad is not None:
+        gaussians._features_rest.grad[static_mask] = 0.0
+    if gaussians._opacity.grad is not None:
+        gaussians._opacity.grad[static_mask] = 0.0
+    if gaussians._scaling.grad is not None:
+        gaussians._scaling.grad[static_mask] = 0.0
+    if gaussians._rotation.grad is not None:
+        gaussians._rotation.grad[static_mask] = 0.0
 """
 Pruning utilities for Gaussian splatting models.
 """
