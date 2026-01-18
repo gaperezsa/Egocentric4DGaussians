@@ -8,8 +8,10 @@ diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
 tensorboard_3d
 screenshots
-data/
-data
+data/ADT/*
+data/ADT
+data/automatic_data_extraction_testing/*
+data/automatic_data_extraction_testing
 raw_ADT_data/
 exploring_ADT_data/
 wandb/
