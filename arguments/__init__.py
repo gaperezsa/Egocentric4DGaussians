@@ -58,6 +58,11 @@ class ModelParams(ParamGroup):
         self.add_points=False
         self.extension=".png"
         self.llffhold=8
+        
+        # ========== HOI4D Phase-Based Training ==========
+        # Enable static-only training for background stages (reduces motion blur)
+        self.use_phase_filtering = False  # Set True for HOI4D datasets with phase_frame_index.txt
+        
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -180,6 +185,11 @@ class OptimizationParams(ParamGroup):
         # Depth error threshold for blame assignment (applies to all stages during rendering)
         self.depth_error_threshold_cm = 10.0  # Pixels with >10cm error are considered "bad"
         self.depth_blame_percent = 0.1  # Fraction of pixels to blame based on depth error
+        
+        # ========== Gaussian Splitting Control ==========
+        # Controls how Gaussians are split during densification
+        self.split_N = 3  # Number of children created per split (default: 3 for ADT, 2 for finer control)
+        self.split_scale_factor = 2.4  # Scale divisor: child_scale = parent_scale / factor (default: 2.4 ≈ 42% size, 2.0 = 50% size)
         
         super().__init__(parser, "Optimization Parameters")
 

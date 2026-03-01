@@ -10,20 +10,21 @@ conda activate Gaussians4D
 # TRAINING COMMAND
 # ====================================================================
 python train_dynamic_depth.py \
-  --batch_size 4 \
-  --background_depth_iterations 500 \
-  --background_RGB_iterations 500 \
-  --dynamics_depth_iterations 500 \
-  --dynamics_RGB_iterations 500 \
-  --fine_iterations 500 \
-  --normal_loss_weight 0.5 \
+  --batch_size 16 \
+  --background_depth_iterations 4000 \
+  --background_RGB_iterations 4000 \
+  --dynamics_depth_iterations 2000 \
+  --dynamics_RGB_iterations 4000 \
+  --fine_iterations 4000 \
+  --normal_loss_weight 0.4 \
   --general_depth_weight 10.0 \
-  --rgb_weight 30.0 \
-  --scale_loss_weight 100.0 \
+  --rgb_weight 80.0 \
+  --scale_loss_weight 300.0 \
   --ssim_weight 0.5 \
-  --chamfer_weight 100.0 \
+  --chamfer_weight 1.0 \
   --plane_tv_weight 0.001 \
-  --configs "arguments/HOI4D/default.py" \
-  --port 6254 \
-  --expname video1_normals_with_gsplat_debug \
-  --source_path "data/with_monst3r/Video1/colmap" \
+  --configs "arguments/ADT/default.py" \
+  --port 6261 \
+  --expname meal_v3 \
+  --source_path "data/ADT/mealV2/colmap" \
+  --start_checkpoint /home/gperezsantamaria/sda_data/ICML_submission/Egocentric4DGaussians/output_best_baselines/ADT/meal_v2/chkpnt_dynamics_RGB_4000.pth

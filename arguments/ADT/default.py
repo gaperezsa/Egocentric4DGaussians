@@ -58,4 +58,6 @@ OptimizationParams = dict(
     opacity_threshold_coarse = 0.1,
     # opacity_threshold_fine_init = 0.005,
     # opacity_threshold_fine_after = 0.005,
+    split_N = 3,              # Number of children per split 3 default
+    split_scale_factor = 0.8*split_N, # Scale divisor: child = parent / factor (2.0 = 50% size, 2.4 = 42% size, 0.8*3=2.4 for 3 children)
 )

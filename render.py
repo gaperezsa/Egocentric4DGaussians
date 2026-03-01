@@ -399,6 +399,91 @@ def render_set_no_compression(
                 print(f"[WARN] Failed to create normal maps video: {e}")
 
 
+def compute_and_save_test_psnr(model_path, name, iteration, test_views, subdir=None):
+    """
+    After render_set_no_compression has written renders/ under
+        model_path/name/[subdir/]ours_{iteration}/
+    read only the test-frame renders (matched by image_name stem), compute
+    per-frame PSNR vs the camera's ground-truth image, print a summary, and
+    save test_psnr.json in that same run directory.
+
+    Returns the result dict, or None if no matching renders were found.
+    """
+    base_dir = os.path.join(model_path, name)
+    if subdir:
+        base_dir = os.path.join(base_dir, subdir)
+    run_dir    = os.path.join(base_dir, f"ours_{iteration}")
+    render_dir = os.path.join(run_dir, "renders")
+
+    if not os.path.isdir(render_dir):
+        print(f"[test PSNR] renders dir missing, skipping: {render_dir}")
+        return None
+
+    per_frame_psnr: dict = {}
+    psnr_vals: list = []
+
+    for view in test_views:
+        # Derive stem the same way render_set_no_compression does
+        raw = getattr(view, "image_name", None)
+        if raw:
+            base = os.path.splitext(os.path.basename(str(raw)))[0]
+            m = re.search(r"(\d+)$", base)
+            stem = str(int(m.group(1))) if m else base
+        else:
+            continue
+
+        render_file = os.path.join(render_dir, f"{stem}.png")
+        if not os.path.exists(render_file):
+            # Silent skip — test frames may legitimately be missing for early stages
+            continue
+
+        # Load rendered PNG → float32 [3, H, W]
+        render_np = np.array(imageio.imread(render_file), dtype=np.float32) / 255.0
+        render_t  = torch.from_numpy(render_np).permute(2, 0, 1).float()  # [3,H,W]
+
+        # GT from camera object — already float [0,1], shape [C, H, W]
+        gt_t = view.original_image[0:3, :, :].float().cpu()
+
+        # Resize render if shapes differ (defensive, shouldn't normally happen)
+        if render_t.shape != gt_t.shape:
+            render_t = torch.nn.functional.interpolate(
+                render_t.unsqueeze(0), size=gt_t.shape[-2:],
+                mode="bilinear", align_corners=False
+            ).squeeze(0)
+
+        mse_val    = ((render_t - gt_t) ** 2).mean().item()
+        frame_psnr = 20.0 * np.log10(1.0 / (np.sqrt(max(mse_val, 1e-10))))
+        per_frame_psnr[stem] = round(frame_psnr, 4)
+        psnr_vals.append(frame_psnr)
+
+    if not psnr_vals:
+        print(f"[test PSNR] no matching test-frame renders found in {render_dir}")
+        return None
+
+    result = {
+        "stage":           name,
+        "iteration":       iteration,
+        "num_test_frames": len(psnr_vals),
+        "mean_psnr_db":    round(float(np.mean(psnr_vals)), 4),
+        "min_psnr_db":     round(float(np.min(psnr_vals)),  4),
+        "max_psnr_db":     round(float(np.max(psnr_vals)),  4),
+        "per_frame_psnr":  per_frame_psnr,
+    }
+
+    out_path = os.path.join(run_dir, "test_psnr.json")
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+
+    print(
+        f"\n[Test-only PSNR | {name}]  "
+        f"mean={result['mean_psnr_db']:.2f} dB  "
+        f"min={result['min_psnr_db']:.2f}  "
+        f"max={result['max_psnr_db']:.2f}  "
+        f"n={len(psnr_vals)} frames  →  {out_path}"
+    )
+    return result
+
+
 def render_all_splits(
     model_path: str,
     iteration: int,

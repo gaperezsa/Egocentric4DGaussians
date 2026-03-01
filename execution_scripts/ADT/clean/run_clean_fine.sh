@@ -25,6 +25,6 @@ python train_dynamic_depth.py \
   --plane_tv_weight 0.001 \
   --configs "arguments/ADT/default.py" \
   --port 6260 \
-  --expname clean_v2 \
+  --expname clean_v3 \
   --source_path "data/ADT/cleanV2/colmap" \
   --start_checkpoint /home/gperezsantamaria/sda_data/ICML_submission/Egocentric4DGaussians/output_best_baselines/ADT/clean_v2/chkpnt_dynamics_RGB_4000.pth

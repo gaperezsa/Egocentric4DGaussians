@@ -10,6 +10,8 @@ tensorboard_3d
 screenshots
 data/ADT/*
 data/ADT
+data/HOI4D/*
+data/HOI4D
 data/automatic_data_extraction_testing/*
 data/automatic_data_extraction_testing
 raw_ADT_data/
@@ -18,3 +20,9 @@ wandb/
 debugging*
 slurm*
 submodules/*
+
+
+debug_extrinsics.py
+gaussian_renderer/debug_removable_densification_visualizer.py
+output_best_baselines/
+visualization_utils/dynamic_pointclouds*

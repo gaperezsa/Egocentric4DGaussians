@@ -11,7 +11,7 @@ def create_video_from_png(folder_path, output_video_path):
     # Print folder name being processed
     print(f"Processing folder: {folder_path}")
     # Search for .png files in the folder
-    png_files = glob.glob(os.path.join(folder_path, '*.jpg'))
+    png_files = glob.glob(os.path.join(folder_path, '*.png'))
     # Sort the list of file paths
     sorted_files = sorted(png_files)
 
@@ -56,6 +56,6 @@ def numerical_sort_key(s):
 if __name__ == "__main__":
     
 
-    folder_path = "/home/gperezsantamaria/sda_data/Egocentric4DGaussians/output/recognition_inital_debug/background_depth_train_render/images"
-    output_video_path = "/home/gperezsantamaria/sda_data/Egocentric4DGaussians/output/recognition_inital_debug/background_depth_train_render/depth_training_video.mp4"
+    folder_path = "/home/gperezsantamaria/sda_data/ICML_submission/metrics_and_visaulizations_sandbox/results/only_dynamic_mask_on_dynamic_frames/HOI4D/unified_visualizations/Video1"
+    output_video_path = "/home/gperezsantamaria/sda_data/ICML_submission/metrics_and_visaulizations_sandbox/results/only_dynamic_mask_on_dynamic_frames/HOI4D/unified_visualizations/Video1/dyn_mask_dyn_frames_vis.mp4"
     create_video_from_png(folder_path, output_video_path)

@@ -40,8 +40,8 @@ OptimizationParams = dict(
     batch_size = 2,
     dynamic_position_lr_init = 1e-16,
     dynamic_position_lr_final = 1e-17,
-    static_position_lr_init = 1e-14,
-    static_position_lr_final = 1e-15,
+    static_position_lr_init = 1e-15,
+    static_position_lr_final = 1e-16,
     
     # ========== Learning Rates - Deformation ==========
     deformation_lr_init = 0.0016,

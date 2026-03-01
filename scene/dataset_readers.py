@@ -275,12 +275,11 @@ def readColmapSceneInfo(path, images, eval, llffhold=2):
         point_cloud=pcd,
         train_cameras=train_cam_infos,
         test_cameras=test_cam_infos,
-        video_cameras=train_cam_infos,
+        video_cameras=sorted(train_cam_infos + test_cam_infos, key=lambda x: x.image_name),
         maxtime=0,
         nerf_normalization=nerf_normalization,
         ply_path=ply_path
     )
-
     return scene_info
 def generateCamerasFromTransforms(path, template_transformsfile, extension, maxtime):
     trans_t = lambda t : torch.Tensor([

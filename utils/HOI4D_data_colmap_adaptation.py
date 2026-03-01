@@ -220,5 +220,86 @@ def main():
 
     shutil.rmtree(FRGB); shutil.rmtree(FDEPTH)
 
+
+# ============================================================================
+# Phase-Based Training Filtering (HOI4D Motion Blur Mitigation)
+# ============================================================================
+def parse_phase_frame_index(source_path):
+    """
+    Parse phase_frame_index.txt to extract static and dynamic frame ranges.
+    
+    Format of phase_frame_index.txt:
+        0,30        ← Static phase (even index)
+        31,106      ← Dynamic phase (odd index)
+        107,134     ← Static phase
+        ...
+    
+    Returns:
+        dict with 'static_phases' (list of tuples) and 'dynamic_phases' (list of tuples)
+        Example: {'static_phases': [(0, 30), (107, 134)], 'dynamic_phases': [(31, 106)]}
+    """
+    phase_file = os.path.join(source_path, 'split', 'phase_frame_index.txt')
+    if not os.path.exists(phase_file):
+        # source_path may point to the colmap/ subdirectory; try one level up
+        phase_file = os.path.join(os.path.dirname(source_path), 'split', 'phase_frame_index.txt')
+    if not os.path.exists(phase_file):
+        print(f"[WARNING] Phase file not found: {phase_file}")
+        return None
+    
+    with open(phase_file, 'r') as f:
+        phases = [tuple(map(int, line.strip().split(','))) for line in f if line.strip()]
+    
+    # Even indices = static phases, odd indices = dynamic phases
+    static_phases = [phases[i] for i in range(len(phases)) if i % 2 == 0]
+    dynamic_phases = [phases[i] for i in range(len(phases)) if i % 2 != 0]
+    
+    print(f"[PHASE FILTERING] Loaded phase_frame_index.txt")
+    print(f"  Static phases (camera still): {static_phases}")
+    print(f"  Dynamic phases (camera moving): {dynamic_phases}")
+    
+    return {'static_phases': static_phases, 'dynamic_phases': dynamic_phases}
+
+def filter_cameras_by_phases(cameras, phases, phase_type='static'):
+    """
+    Filter camera list to only include frames within specified phase ranges.
+    
+    Args:
+        cameras: List of camera objects (with .uid or .image_name attribute)
+        phases: dict from parse_phase_frame_index() or None
+        phase_type: 'static' or 'dynamic' or 'all'
+    
+    Returns:
+        Filtered list of cameras
+    """
+    if phases is None or phase_type == 'all':
+        return cameras
+    
+    phase_list = phases.get(f'{phase_type}_phases', [])
+    if not phase_list:
+        print(f"[WARNING] No {phase_type} phases found, using all frames")
+        return cameras
+    
+    # Filter cameras based on actual frame number extracted from image name
+    # cam.uid is the sequential position in the training split (0,1,2,...), NOT the frame number.
+    # The frame number is encoded in cam.image_name, e.g. 'camera_rgb_00042' → frame 42.
+    import re
+    filtered_cameras = []
+    for cam in cameras:
+        # Extract trailing digits from image_name (works for 'camera_rgb_00042', '00042', etc.)
+        m = re.search(r'(\d+)$', cam.image_name)
+        if m:
+            frame_idx = int(m.group(1))
+        else:
+            # Fallback: uid (likely wrong, but better than crashing)
+            frame_idx = cam.uid
+        for start, end in phase_list:
+            if start <= frame_idx <= end:
+                filtered_cameras.append(cam)
+                break
+    
+    print(f"[PHASE FILTERING] {phase_type.capitalize()} frames: {len(filtered_cameras)}/{len(cameras)} cameras")
+    return filtered_cameras
+
+
 if __name__=="__main__":
     main()

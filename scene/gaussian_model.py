@@ -279,7 +279,7 @@ class GaussianModel:
             self._xyz.register_hook(_dynamic_grad_hook)
 
             l = [
-                {'params': [self._xyz], 'lr': 0.1, "name": "xyz"},
+                {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': 0, "name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()), 'lr': 0, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -289,7 +289,7 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
             max_steps = max(training_args.position_lr_max_steps, training_args.background_RGB_iterations, training_args.background_depth_iterations)
-            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.static_position_lr_init * self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=(training_args.static_position_lr_init-training_args.static_position_lr_final)/4 * self.spatial_lr_scale * 0.4,
                                                     lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
@@ -434,7 +434,7 @@ class GaussianModel:
             self._xyz.register_hook(_dynamic_grad_hook)
 
             l = [
-                {'params': [self._xyz], 'lr': 1.0, "name": "xyz"},
+                {'params': [self._xyz], 'lr': 0.4, "name": "xyz"},
                 {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler *0.1, "name": "deformation"},
                 {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale * training_args.fine_opt_dyn_lr_downscaler *0.1, "name": "grid"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -444,7 +444,8 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
             max_steps = min(training_args.position_lr_max_steps, training_args.fine_iterations)
-            self.static_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.static_position_lr_init * self.spatial_lr_scale,
+            #self.static_xyz_scheduler_args = get_linear_lr_func(lr_init=(training_args.static_position_lr_init-training_args.static_position_lr_final)/6 * self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_linear_lr_func(lr_init=training_args.static_position_lr_final*self.spatial_lr_scale,
                                                     lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
@@ -863,7 +864,7 @@ class GaussianModel:
 
 
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3, percentage_of_train_stage_remaining = 1):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3, percentage_of_train_stage_remaining = 1, split_scale_factor=2.4):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -884,12 +885,12 @@ class GaussianModel:
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_dynamic_xyz = self._dynamic_xyz[selected_pts_mask].repeat(N)
         
-        # Initialize new scales: divide by (0.8*N) but preserve the minimum scale of each parent
+        # Initialize new scales: divide by split_scale_factor (configurable, default 2.4 for N=3)
         # This keeps the child's thinness from the parent while allowing scale loss to reshape it
         parent_scales = self.get_scaling[selected_pts_mask].repeat(N,1)  # [M, 3]
         
-        # Standard division by 0.8*N
-        new_scales_divided = parent_scales / (0.8*N)  # [M, 3]
+        # Configurable scale division (e.g., 2.4 for ~42% size, 2.0 for 50% size)
+        new_scales_divided = parent_scales / split_scale_factor  # [M, 3]
         
         # Find minimum scale component for each parent (before division)
         parent_min_scale = torch.min(parent_scales[:parent_scales.shape[0]//N], dim=1, keepdim=True).values  # [M//N, 1]
@@ -913,7 +914,8 @@ class GaussianModel:
             max_scales = new_scales_activated.max(dim=1)[0]
             mean_scales = new_scales_activated.mean(dim=1)
             ratio = min_scales / (mean_scales + 1e-6)
-            print(f"  [Densify Split] Creating {new_xyz.shape[0]} Gaussians")
+            print(f"  [Densify Split] Creating {new_xyz.shape[0]} Gaussians (N={N} children/parent, scale_factor={split_scale_factor:.2f})")
+            print(f"    Parent → Child size: {100.0/split_scale_factor:.1f}% of original")
             print(f"    Scale ratio (min/mean): {ratio.mean():.6f} ± {ratio.std():.6f}")
             print(f"    Min scale: {min_scales.mean():.6f}, Max scale: {max_scales.mean():.6f}")
         
@@ -930,7 +932,8 @@ class GaussianModel:
         scene_extent: float,
         N: int = 3,
         median_dist: float = 0.1,
-        percentage_of_train_stage_remaining: float = 1.0
+        percentage_of_train_stage_remaining: float = 1.0,
+        split_scale_factor: float = 2.4
     ):
         """
         Dynamic Gaussian splitting aligned to parent ellipsoid axes (static-like),
@@ -939,7 +942,7 @@ class GaussianModel:
         Differences vs original dynamic version:
         - Sample offsets in the parent's local frame with per-axis std = factor * parent_scale.
         - Rotate offsets to world space via quaternion (build_rotation).
-        - Shrink child scales like the static function (/(0.8*N)) and prune parents.
+        - Shrink child scales by split_scale_factor (configurable, default 2.4) and prune parents.
         - Cull children whose world-space offset norm > median_dist.
 
         Args:
@@ -948,7 +951,8 @@ class GaussianModel:
             scene_extent: used to gate by size like in the static function.
             N: children per selected parent.
             median_dist: culling radius for spawned children (world-space).
-            percentage_of_train_stage_remaining: multiplies parent per-axis scales to set local sampling std. smaller as treining goes on
+            percentage_of_train_stage_remaining: multiplies parent per-axis scales to set local sampling std. smaller as training goes on
+            split_scale_factor: divisor for child scales (e.g., 2.4 for ~42% size, 2.0 for 50% size)
         """
         device = self._xyz.device
         n_pts = self.get_xyz.shape[0]
@@ -1014,7 +1018,7 @@ class GaussianModel:
 
         # Child scaling: same rule as static: shrink in *data space* then map back to param space
         parent_scale_rep = self.get_scaling[sel].repeat_interleave(N, dim=0)  # [K*N, 3] data-space
-        child_scale_data = (parent_scale_rep / (0.8 * N))[keep]               # [M, 3]
+        child_scale_data = (parent_scale_rep / split_scale_factor)[keep]      # [M, 3] - configurable factor
         new_scaling      = self.scaling_inverse_activation(child_scale_data)  # param-space
 
         # 8) Append children
@@ -1086,65 +1090,89 @@ class GaussianModel:
         #     o3d.io.write_point_cloud(os.path.join(write_path,f"iteration_{stage}{iteration}.ply"),point)
         #     print("write output.")
 
-    def spawn_dynamic_gaussians(self, random_init=True, precomputed_positions=None):
+    def spawn_dynamic_gaussians(self, random_init=True, precomputed_positions=None, min_dynamic_gaussians=10000):
         """
-        Very‐local, Chamfer‐adaptive splitting of dynamic Gaussians.
+        Spawn dynamic Gaussians, guaranteeing at least `min_dynamic_gaussians` are created.
+
+        Seed positions come from either `precomputed_positions` or a random 1% of existing
+        Gaussians.  If the seed count is below `min_dynamic_gaussians`, extra Gaussians are
+        placed near the seeds: for each extra point we pick a random seed as centre and perturb
+        it by N(0, sigma) where sigma is that seed's mean k-NN distance to its 10 nearest seeds.
+        This densifies every dynamic object region without straying outside it.
 
         Args:
-            random_init (Bool): initiate dynamic gaussians randomly?.
-            precomputed_positions (tensor of shape Mx3): list of xyz coordinates to initiate dynamic gaussians.
+            random_init (bool): use random 1% of existing Gaussians as seeds.
+            precomputed_positions (Tensor [M, 3]): explicit seed positions.
+            min_dynamic_gaussians (int): minimum total dynamic Gaussians to spawn (default 10000).
         """
-
-        # 1) Select a random subset if not provided
+        # ── 1. Determine seed mask & seed positions ────────────────────────────────
         if random_init:
             selected_pts_mask = torch.rand(self._xyz.shape[0], device=self._xyz.device) < 0.01
         else:
             if precomputed_positions is not None:
-                sampled_ids = sample(range(self._xyz.shape[0]),precomputed_positions.shape[0])
-                selected_pts_mask = torch.zeros(self._xyz.shape[0])
-                selected_pts_mask[sampled_ids] = 1
-                selected_pts_mask = selected_pts_mask > 0
+                sampled_ids = sample(range(self._xyz.shape[0]), precomputed_positions.shape[0])
+                selected_pts_mask = torch.zeros(self._xyz.shape[0], dtype=torch.bool)
+                selected_pts_mask[sampled_ids] = True
             else:
-                print("\nrandom init is has been manually set to false but precomputed positions were not provided either")
-                print("\ndefault random is going to be assumed, manual deactivation of random is ignored")
+                print("\nrandom_init=False but no precomputed_positions provided — falling back to random.")
                 selected_pts_mask = torch.rand(self._xyz.shape[0], device=self._xyz.device) < 0.01
 
-        n_new = selected_pts_mask.sum().item()
-        if n_new == 0:
+        if selected_pts_mask.sum().item() == 0:
             return
 
-        # 2) Compute “standard” size & opacity from the existing set
-        #    - median scaling along each axis
-        median_scale = torch.median(self._scaling, dim=0).values  # shape: (3,)
-        #    - maximum opacity
-        max_opacity = self._opacity.max().item()                  # scalar
-        # 3) Gather the positions & rotations & features for the selected centers
-        if precomputed_positions is None:
-            new_xyz            = self._xyz[selected_pts_mask]
+        # ── 2. Shared statistics from existing model ──────────────────────────────
+        dev          = self._xyz.device
+        median_scale = torch.median(self._scaling, dim=0).values   # (3,)
+        max_opacity  = self._opacity.max().item()                   # scalar
+
+        # ── 3. Seed positions & attributes ────────────────────────────────────────
+        seed_xyz   = (precomputed_positions.to(dev).detach()
+                      if precomputed_positions is not None
+                      else self._xyz[selected_pts_mask].detach())   # (S, 3)
+        seed_fdc   = self._features_dc[selected_pts_mask]
+        seed_frest = self._features_rest[selected_pts_mask]
+        seed_rot   = self._rotation[selected_pts_mask]
+        seed_dtbl  = self._deformation_table[selected_pts_mask]
+
+        S = seed_xyz.shape[0]
+
+        # ── 4. Compute per-seed k-NN std for perturbation ─────────────────────────
+        k = min(10, S)
+        with torch.no_grad():
+            diff  = seed_xyz.unsqueeze(0) - seed_xyz.unsqueeze(1)   # (S, S, 3)
+            dists = diff.norm(dim=-1)                                # (S, S)
+            dists.fill_diagonal_(float('inf'))
+            knn_dists, _ = torch.topk(dists, k, dim=1, largest=False)  # (S, k)
+            per_seed_std = knn_dists.mean(dim=1)                        # (S,)
+
+        # ── 5. Build extra Gaussians to reach min_dynamic_gaussians ──────────────
+        n_extra = max(0, min_dynamic_gaussians - S)
+        print(f"[spawn_dynamic] seeds={S:,}  n_extra={n_extra:,}  "
+              f"kNN std (mean)={per_seed_std.mean().item():.4f} m  total={S+n_extra:,}")
+
+        if n_extra > 0:
+            parent_idx = torch.randint(0, S, (n_extra,), device=dev)
+            stds       = per_seed_std[parent_idx].unsqueeze(1)
+            extra_xyz  = seed_xyz[parent_idx] + torch.randn(n_extra, 3, device=dev) * stds
+
+            all_xyz   = torch.cat([seed_xyz,   extra_xyz],              dim=0)
+            all_fdc   = torch.cat([seed_fdc,   seed_fdc[parent_idx]],   dim=0)
+            all_frest = torch.cat([seed_frest, seed_frest[parent_idx]], dim=0)
+            all_rot   = torch.cat([seed_rot,   seed_rot[parent_idx]],   dim=0)
+            all_dtbl  = torch.cat([seed_dtbl,  seed_dtbl[parent_idx]],  dim=0)
         else:
-            new_xyz            = precomputed_positions.to(self._xyz.device)
-        new_dynamic_xyz    = torch.ones(n_new, dtype=torch.bool, device=self._xyz.device)
-        new_features_dc    = self._features_dc[selected_pts_mask]
-        new_features_rest  = self._features_rest[selected_pts_mask]
-        new_rotation       = self._rotation[selected_pts_mask]
-        new_deformation_tbl= self._deformation_table[selected_pts_mask]
+            all_xyz, all_fdc, all_frest, all_rot, all_dtbl = (
+                seed_xyz, seed_fdc, seed_frest, seed_rot, seed_dtbl)
 
-        # 4) Override their scale & opacity to be uniform
-        #    - expand median_scale from (3,) → (n_new, 3)
-        new_scaling = median_scale.unsqueeze(0).repeat(n_new, 1)
-        #    - create an (n_new, 1) tensor at max_opacity
-        new_opacities = torch.full((n_new, 1), max_opacity, device=self._xyz.device)
+        n_total       = all_xyz.shape[0]
+        new_scaling   = median_scale.unsqueeze(0).repeat(n_total, 1)
+        new_opacities = torch.full((n_total, 1), max_opacity, device=dev)
+        new_dynamic   = torch.ones(n_total, dtype=torch.bool, device=dev)
 
-        # 5) Append them into your model’s buffers
+        # ── 6. Append into model buffers ──────────────────────────────────────────
         self.densification_postfix(
-            new_xyz,
-            new_dynamic_xyz,
-            new_features_dc,
-            new_features_rest,
-            new_opacities,
-            new_scaling,
-            new_rotation,
-            new_deformation_tbl
+            all_xyz, new_dynamic, all_fdc, all_frest,
+            new_opacities, new_scaling, all_rot, all_dtbl,
         )
 
     @property
@@ -1322,16 +1350,16 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def densify(self, max_grad, min_opacity, extent, median_dist=None, percentage_of_train_stage_remaining=1.0):
+    def densify(self, max_grad, min_opacity, extent, median_dist=None, percentage_of_train_stage_remaining=1.0, split_N=3, split_scale_factor=2.4):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
         
         if median_dist != None:
-            self.densify_and_split_dynamic(grads, max_grad, extent, median_dist=median_dist, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining)
+            self.densify_and_split_dynamic(grads, max_grad, extent, N=split_N, median_dist=median_dist, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining, split_scale_factor=split_scale_factor)
         else:
-            self.densify_and_split(grads, max_grad, extent, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining)
+            self.densify_and_split(grads, max_grad, extent, N=split_N, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining, split_scale_factor=split_scale_factor)
 
 
     def densify_dynamic(self, max_grad, min_opacity, extent, median_dist=None, percentage_of_train_stage_remaining=1.0):
@@ -1715,6 +1743,7 @@ class GaussianModel:
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
 
+    
     def capture_reference_deformation_by_time(self, time):
         means3D = self.get_xyz
         opacity = self._opacity
