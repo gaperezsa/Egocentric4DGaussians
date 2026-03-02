@@ -19,7 +19,7 @@ import cv2
 from random import randint
 from utils.exocentric_utils import compute_exocentric_from_file
 from utils.graphics_utils import getWorld2View2
-from utils.loss_utils import l1_loss, l1_filtered_loss, chamfer_loss, chamfer_with_median, l1_background_colored_masked_loss, gradient_aware_depth_loss, ssim
+from utils.loss_utils import l1_loss, l1_filtered_loss, chamfer_loss, chamfer_with_median, l1_background_colored_masked_loss, gradient_aware_depth_loss, ssim, masked_ssim
 from utils.dn_splatter_utils import (
     normal_regularization_loss,
     scale_regularization_loss
@@ -52,6 +52,7 @@ import wandb
 import socket
 from datetime import datetime
 from utils.HOI4D_data_colmap_adaptation import parse_phase_frame_index, filter_cameras_by_phases
+from utils.importance_sampling_utils import compute_high_loss_cam_ids, build_importance_sampled_pool
 
 to8b = lambda x: (255 * np.clip(x.cpu().numpy(), 0, 1)).astype(np.uint8)
 
@@ -94,7 +95,19 @@ def check_and_sort_viewpoint_stack(viewpoint_stack):
 # Core training loop per stage
 def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, using_wandb, train_iter, timer, first_iter=0):
+                         gaussians, scene, stage, tb_writer, using_wandb, train_iter, timer, first_iter=0,
+                         high_loss_cam_ids=None):
+
+    # ====================================================================
+    # ALL-DYNAMIC FINE COLORING: If requested, mark every Gaussian as
+    # dynamic before calling training_setup so that:
+    #   - ALL Gaussians receive the (low) dynamic position learning rate
+    #   - The deformation network can compensate for the whole scene
+    #   - There are 0 static Gaussians (no freezing applied)
+    # ====================================================================
+    if stage == "fine_coloring" and getattr(opt, 'all_dynamic_on_fine', False):
+        print("[all_dynamic_on_fine] Marking ALL Gaussians as dynamic before fine_coloring training_setup.")
+        gaussians.mark_all_as_dynamic()
 
     # Setup learning rates based on stage
     gaussians.training_setup(opt, stage)
@@ -111,8 +124,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
 
     rendering_only_background_or_only_dynamic = stage != "fine_coloring"
     depth_only_stage = stage in ("background_depth", "dynamics_depth")
-
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    bg_color = [1, 1, 1] if dataset.white_background else [1, 0, 1]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -160,6 +172,11 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         viewpoint_stack = list(train_cams)
         viewpoint_stack = check_and_sort_viewpoint_stack(viewpoint_stack)
         temp_list = copy.deepcopy(viewpoint_stack)
+
+        # Importance sampling: duplicate high-loss cameras in the pool (~2x frequency).
+        # build_importance_sampled_pool is a no-op when high_loss_cam_ids is None/empty.
+        if stage == "fine_coloring" and high_loss_cam_ids:
+            temp_list = build_importance_sampled_pool(temp_list, high_loss_cam_ids)
 
     batch_size = opt.batch_size
     print("data loading done")
@@ -307,7 +324,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 hyper.normal_loss_weight > 0 and
                 viewpoint_cam.normal_map is not None
             )
-           
             pkg = render_with_dynamic_gaussians_mask(
                 viewpoint_cam, gaussians, pipe, background,
                 stage=stage, cam_type=scene.dataset_type,
@@ -455,7 +471,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         # ====================================================================
         # STEP 3: Compute losses per stage (UNWEIGHTED, organized by stage)
         # ====================================================================
-        
         # ------------------ STAGE: background_depth ------------------
         if stage == "background_depth":
             # RGB loss: static regions only
@@ -559,15 +574,15 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             # Chamfer loss on dynamic point clouds
             dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
 
-        # K-Planes temporal regulation: penalize temporal acceleration (XT/YT/ZT planes)
-        # and pull unsupervised frames toward neutral deformation (l1 on spatiotemporal planes).
-        # _plane_regulation (XY/XZ/YZ spatial smoothness) is not needed here → plane_tv_weight=0.0
-        if hyper.time_smoothness_weight != 0 or hyper.l1_time_planes != 0:
-            reg_loss = gaussians.compute_regulation(
-                time_smoothness_weight=hyper.time_smoothness_weight,
-                l1_time_planes_weight=hyper.l1_time_planes,
-                plane_tv_weight=0.0
-            )
+            # K-Planes temporal regulation: penalize temporal acceleration (XT/YT/ZT planes)
+            # and pull unsupervised frames toward neutral deformation (l1 on spatiotemporal planes).
+            # _plane_regulation (XY/XZ/YZ spatial smoothness) is not needed here → plane_tv_weight=0.0
+            if hyper.time_smoothness_weight != 0 or hyper.l1_time_planes != 0:
+                reg_loss = gaussians.compute_regulation(
+                    time_smoothness_weight=hyper.time_smoothness_weight,
+                    l1_time_planes_weight=hyper.l1_time_planes,
+                    plane_tv_weight=0.0
+                )
         
         # ------------------ STAGE: dynamics_RGB ------------------
         elif stage == "dynamics_RGB":
@@ -606,31 +621,57 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             else:
                 depth_loss = l1_loss(dynamic_only_depth_image_tensor, masked_gt_depth)
         
-        # K-Planes temporal regulation: penalize temporal acceleration (XT/YT/ZT planes)
-        # and pull unsupervised frames toward neutral deformation (l1 on spatiotemporal planes).
-        # _plane_regulation (XY/XZ/YZ spatial smoothness) is not needed here → plane_tv_weight=0.0
-        if hyper.time_smoothness_weight != 0 or hyper.l1_time_planes != 0:
-            reg_loss = gaussians.compute_regulation(
-                time_smoothness_weight=hyper.time_smoothness_weight,
-                l1_time_planes_weight=hyper.l1_time_planes,
-                plane_tv_weight=0.0
-            )
+            # K-Planes temporal regulation: penalize temporal acceleration (XT/YT/ZT planes)
+            # and pull unsupervised frames toward neutral deformation (l1 on spatiotemporal planes).
+            # _plane_regulation (XY/XZ/YZ spatial smoothness) is not needed here → plane_tv_weight=0.0
+            if hyper.time_smoothness_weight != 0 or hyper.l1_time_planes != 0:
+                reg_loss = gaussians.compute_regulation(
+                    time_smoothness_weight=hyper.time_smoothness_weight,
+                    l1_time_planes_weight=hyper.l1_time_planes,
+                    plane_tv_weight=0.0
+                )
         
         # ------------------ STAGE: fine_coloring ------------------
         elif stage == "fine_coloring":
             # RGB loss: full image
             image_tensor = torch.cat(images, 0)
             gt_image_tensor = torch.cat(gt_images, 0)
-            Ll1 = l1_loss(image_tensor, gt_image_tensor[:, :3, :, :])
-            
+
+            # ---- Build spatial border-exclusion mask (no-op when both params == 0) ----
+            _crop_left   = getattr(opt, 'border_crop_left',   0)
+            _crop_bottom = getattr(opt, 'border_crop_bottom', 0)
+            _use_border_mask = (_crop_left > 0 or _crop_bottom > 0)
+            if _use_border_mask:
+                _B, _C, _H, _W = image_tensor.shape
+                _border_hw = torch.ones(_H, _W, dtype=torch.bool, device=image_tensor.device)
+                if _crop_left > 0:
+                    _border_hw[:, :_crop_left] = False
+                if _crop_bottom > 0:
+                    _border_hw[-_crop_bottom:, :] = False
+                # Expand to [B, 3, H, W] for RGB, [B, 1, H, W] for 4-D depth, [B, H, W] for 3-D depth
+                _border_3c  = _border_hw.unsqueeze(0).unsqueeze(0).expand(_B, 3, _H, _W)
+                _border_1c  = _border_hw.unsqueeze(0).unsqueeze(0).expand(_B, 1, _H, _W)
+                _border_bhw = _border_hw.unsqueeze(0).expand(_B, _H, _W)  # for [B, H, W] depth tensors
+                Ll1 = l1_filtered_loss(image_tensor, gt_image_tensor[:, :3, :, :], mask=_border_3c)
+            else:
+                Ll1 = l1_loss(image_tensor, gt_image_tensor[:, :3, :, :])
+                _border_hw  = None
+                _border_1c  = None
+                _border_3c  = None
+                _border_bhw = None
+
             # Depth loss: full image (with 0.5 weight factor)
             if hyper.use_gradient_aware_depth and image_gradient_tensor is not None:
                 depth_loss = 0.5 * gradient_aware_depth_loss(
                     depth_image_tensor, gt_depth_image_tensor,
-                    image_gradient=image_gradient_tensor, mask=None
+                    image_gradient=image_gradient_tensor,
+                    mask=_border_hw  # None when border mask is disabled
                 )
             else:
-                depth_loss = 0.5 * l1_loss(depth_image_tensor, gt_depth_image_tensor)
+                if _use_border_mask:
+                    depth_loss = 0.5 * l1_filtered_loss(depth_image_tensor, gt_depth_image_tensor, mask=_border_bhw)
+                else:
+                    depth_loss = 0.5 * l1_loss(depth_image_tensor, gt_depth_image_tensor)
             
             # Normal loss: static regions only
             # if len(rendered_normal_maps) > 0 and len(gt_normal_maps) > 0:
@@ -674,7 +715,10 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             
             # SSIM loss
             if hyper.ssim_weight != 0:
-                ssim_loss_val = 1.0 - ssim(image_tensor, gt_image_tensor)
+                if _use_border_mask:
+                    ssim_loss_val = masked_ssim(image_tensor, gt_image_tensor[:, :3, :, :], mask=_border_3c)
+                else:
+                    ssim_loss_val = 1.0 - ssim(image_tensor, gt_image_tensor)
         
         # ====================================================================
         # STEP 4: Combine all losses with weights
@@ -685,8 +729,8 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
              + hyper.chamfer_weight * dynamic_mask_loss \
              + hyper.normal_loss_weight * normal_loss \
              + hyper.scale_loss_weight * scale_loss \
-             + hyper.ssim_weight * ssim_loss_val
-             loss = loss + reg_loss
+             + hyper.ssim_weight * ssim_loss_val \
+             + reg_loss
 
         # ====================================================================
         # REGULARIZATION: Enforce zero deformation at t=0
@@ -1013,13 +1057,18 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                         gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, median_dist=None, percentage_of_train_stage_remaining=percentage_of_train_stage_remaining, split_N=opt.split_N, split_scale_factor=opt.split_scale_factor)
                 
                 # prune
-                if iteration > opt.pruning_from_iter and iteration < int(0.8 * final_iter) and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
+                if iteration > opt.pruning_from_iter and iteration < opt.densify_until_iter and iteration < int(0.7 * final_iter) and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
                     # Prune using depth error blame scores (mean error = sum / count)
+                    if stage == "fine_coloring":
+                        depth_blame_percent = None
+                    else:
+                        depth_blame_percent = opt.depth_blame_percent
+
                     gaussians.prune(
                         opacity_threshold,
                         max_scale = opt.scale_pruning_factor * scene.cameras_extent,
                         max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2)),
-                        depth_blame_percent = opt.depth_blame_percent
+                        depth_blame_percent = depth_blame_percent
                     )
                     print(f"[ITER {iteration}] Pruned with depth blame percent: {opt.depth_blame_percent}")
                     
@@ -1084,6 +1133,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             if (iteration in checkpoint_iterations) or iteration == final_iter:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
+
 
 
 def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, using_wandb):
@@ -1163,11 +1213,24 @@ def dynamic_depth_training(dataset, hyper, opt, pipe, testing_iterations, saving
         compute_and_save_test_psnr(dataset.model_path, "dynamics_RGB_render", total_iters, test_cams)
         current_stage = stages[4]
 
+    # ====================================================================
+    # IMPORTANCE SAMPLING: compute per-frame train loss right after dynamics_RGB
+    # to identify which views the model struggles with most.  Only runs when
+    # opt.importance_sampling_fine=True; otherwise high_loss_cam_ids stays None
+    # and fine_coloring uses uniform sampling (identical to previous behaviour).
+    # ====================================================================
+    high_loss_cam_ids = None
+    if current_stage == stages[4] and getattr(opt, 'importance_sampling_fine', False):
+        high_loss_cam_ids = compute_high_loss_cam_ids(
+            scene, gaussians, render_with_dynamic_gaussians_mask,
+            pipe, background, cam_type, dataset.model_path, threshold_sigma=1.0
+        )
 
     if  current_stage == stages[4]:
         dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                                 checkpoint_iterations, checkpoint, debug_from,
-                                gaussians, scene, "fine_coloring", tb_writer, using_wandb, training_iters[4], timer, first_iters[4])
+                                gaussians, scene, "fine_coloring", tb_writer, using_wandb, training_iters[4], timer, first_iters[4],
+                                high_loss_cam_ids=high_loss_cam_ids)
         render_set_no_compression(dataset.model_path, "fine_coloring_render", total_iters, scene.getVideoCameras(), gaussians, pipe, background, cam_type, aria=False, render_func = render_with_dynamic_gaussians_mask, source_path=dataset.source_path, write_true_depth_gt=True)
         compute_and_save_test_psnr(dataset.model_path, "fine_coloring_render", total_iters, test_cams)
     
@@ -1451,6 +1514,11 @@ if __name__ == "__main__":
     parser.add_argument("--configs", type=str, default = "")
     parser.add_argument("--bounding_box_masked_depth_flag", action="store_true")
     parser.add_argument("--bs", type=int, default = 16)
+    # Explicit black-background override.
+    # --white_background is registered by ModelParams with action="store_true" and default=True,
+    # which means it can ONLY ever be set to True by argparse (no way to pass False via CLI).
+    # --black_background is the escape hatch: passing it forces white_background=False after parsing.
+    parser.add_argument("--black_background", action="store_true", default=False)
 
     # ====================================================================
     # Grid-searched hyperparameters (Stage iterations)
@@ -1475,6 +1543,15 @@ if __name__ == "__main__":
         config = mmengine.Config.fromfile(args.configs)
         # Pass sys.argv so CLI args take priority over config
         args = merge_hparams(args, config, cli_args=sys.argv)
+
+    # --black_background CLI flag overrides white_background unconditionally.
+    # This is necessary because ModelParams registers --white_background as
+    # action="store_true" with default=True, making it impossible to set False
+    # via CLI or via config (store_true ignores setattr False from merge_hparams).
+    if getattr(args, 'black_background', False):
+        args.white_background = False
+        print("[CONFIG] --black_background set: white_background forced to False (pink/magenta background)")
+    print("white_background =", args.white_background)
     print("Optimizing " + args.model_path)
 
     # ====================================================================

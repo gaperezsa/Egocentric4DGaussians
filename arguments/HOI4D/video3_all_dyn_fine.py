@@ -35,13 +35,13 @@ OptimizationParams = dict(
     dynamics_depth_iterations = 200,
     dynamics_RGB_iterations = 200,
     fine_iterations = 300,
-    
+    fine_opt_dyn_lr_downscaler = 1,
     # ========== Learning Rates - Position ==========
     batch_size = 2,
     dynamic_position_lr_init = 1e-16,
     dynamic_position_lr_final = 1e-17,
-    static_position_lr_init = 1e-15,
-    static_position_lr_final = 1e-16,
+    static_position_lr_init = 1e-14,
+    static_position_lr_final = 1e-15,
     
     # ========== Learning Rates - Deformation ==========
     deformation_lr_init = 0.0016,
@@ -54,7 +54,7 @@ OptimizationParams = dict(
     densify_from_iter = 500,
     densification_interval = 400,
     pruning_interval = 300,
-    densify_until_iter = 5_000,
+    densify_until_iter = 3_000,
     opacity_reset_interval = 2100,
     scale_pruning_factor = 1.0,
     

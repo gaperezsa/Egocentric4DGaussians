@@ -21,7 +21,7 @@ ModelHiddenParams = dict(
     #   Directly combats erratic frame-to-frame deformation on unsupervised (test) frames.
     #   Diagnostic at iter 2000 (Video1): _time_regulation raw=2.24, weighted RGB=0.68
     #   → weight=0.03 makes temporal regulation ~10% of RGB loss
-    time_smoothness_weight = 0.5,
+    time_smoothness_weight = 10,
     # l1_time_planes: pulls XT/YT/ZT plane values toward neutral (1 = no deformation).
     #   Makes unsupervised odd frames default toward "no deformation" rather than arbitrary values.
     l1_time_planes = 0.001,
@@ -54,7 +54,7 @@ OptimizationParams = dict(
     densify_from_iter = 500,
     densification_interval = 400,
     pruning_interval = 300,
-    densify_until_iter = 5_000,
+    densify_until_iter = 3_000,
     opacity_reset_interval = 2100,
     scale_pruning_factor = 1.0,
     
@@ -72,6 +72,12 @@ OptimizationParams = dict(
 
     # ========== All-Dynamic Fine Coloring ==========
     all_dynamic_on_fine = True,
+    
+    # ========== Importance Sampling for Fine Coloring ==========
+    # When True, compute per-frame RGB L1 loss on all training views right after
+    # dynamics_RGB finishes. Frames with loss > mean + 1σ are duplicated in the
+    # fine_coloring viewpoint pool so they are sampled ~2x as often.
+    importance_sampling_fine = True,
 )
 
 

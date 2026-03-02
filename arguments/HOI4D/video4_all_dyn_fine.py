@@ -54,7 +54,7 @@ OptimizationParams = dict(
     densify_from_iter = 500,
     densification_interval = 400,
     pruning_interval = 300,
-    densify_until_iter = 5_000,
+    densify_until_iter = 3_000,
     opacity_reset_interval = 2100,
     scale_pruning_factor = 1.0,
     

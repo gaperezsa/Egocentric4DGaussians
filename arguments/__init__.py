@@ -191,6 +191,29 @@ class OptimizationParams(ParamGroup):
         self.split_N = 3  # Number of children created per split (default: 3 for ADT, 2 for finer control)
         self.split_scale_factor = 2.4  # Scale divisor: child_scale = parent_scale / factor (default: 2.4 ≈ 42% size, 2.0 = 50% size)
         
+        # ========== All-Dynamic Fine Coloring ==========
+        # When True, marks ALL Gaussians (static + dynamic) as dynamic at the start of the
+        # fine_coloring stage. This gives every Gaussian the (lower) dynamic learning rate,
+        # allowing previously-static Gaussians to still learn small corrections while the
+        # deformation network compensates for data issues across the whole scene.
+        self.all_dynamic_on_fine = False
+
+        # ========== Importance Sampling for Fine Coloring ==========
+        # When True, compute per-frame RGB L1 loss on all training views right after
+        # dynamics_RGB finishes. Frames with loss > mean + 1σ are duplicated in the
+        # fine_coloring viewpoint pool so they are sampled ~2x as often.
+        # Falls back silently to uniform sampling when:
+        #   - The flag is False (default, all existing runs unaffected)
+        #   - Resuming directly into fine_coloring (no dynamics_RGB render available)
+        self.importance_sampling_fine = False
+
+        # ========== Border-crop masking for fine_coloring losses ==========
+        # Pixels within these borders are excluded from ALL loss computations
+        # (RGB L1, depth, SSIM) during fine_coloring.  Tensor shapes are unchanged
+        # so nothing else in the pipeline breaks.  0 = disabled (default).
+        self.border_crop_left   = 0   # pixels to ignore from the left edge
+        self.border_crop_bottom = 0   # pixels to ignore from the bottom edge
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

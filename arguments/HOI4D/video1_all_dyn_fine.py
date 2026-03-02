@@ -40,8 +40,8 @@ OptimizationParams = dict(
     batch_size = 2,
     dynamic_position_lr_init = 1e-16,
     dynamic_position_lr_final = 1e-17,
-    static_position_lr_init = 1e-15,
-    static_position_lr_final = 1e-16,
+    static_position_lr_init = 1e-14,
+    static_position_lr_final = 1e-15,
     
     # ========== Learning Rates - Deformation ==========
     deformation_lr_init = 0.0016,
@@ -54,7 +54,7 @@ OptimizationParams = dict(
     densify_from_iter = 500,
     densification_interval = 400,
     pruning_interval = 300,
-    densify_until_iter = 5_000,
+    densify_until_iter = 3_000,
     opacity_reset_interval = 2100,
     scale_pruning_factor = 1.0,
     
@@ -72,6 +72,12 @@ OptimizationParams = dict(
 
     # ========== All-Dynamic Fine Coloring ==========
     all_dynamic_on_fine = True,
+
+    # ========== Importance Sampling for Fine Coloring ==========
+    # When True, compute per-frame RGB L1 loss on all training views right after
+    # dynamics_RGB finishes. Frames with loss > mean + 1σ are duplicated in the
+    # fine_coloring viewpoint pool so they are sampled ~2x as often.
+    importance_sampling_fine = True,
 )
 
 

@@ -190,6 +190,18 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
 
+    def mark_all_as_dynamic(self):
+        """Mark every Gaussian as dynamic so the deformation network covers the full scene.
+
+        This is used by the ``all_dynamic_on_fine`` flag: entering the fine_coloring stage
+        we set _dynamic_xyz=True for all Gaussians so they all receive the (lower) dynamic
+        position learning-rate and can be reached by the deformation network.
+        There are effectively 0 static Gaussians afterwards.
+        """
+        N = self._xyz.shape[0]
+        self._dynamic_xyz = torch.ones(N, dtype=torch.bool, device=self._xyz.device)
+        print(f"[mark_all_as_dynamic] Set ALL {N} Gaussians to dynamic (0 static remaining).")
+
     def erase_non_dynamic_grads(self):
         self._xyz.grad[~self._dynamic_xyz] *= 0
         self._features_dc.grad[~self._dynamic_xyz] *= 0
@@ -444,8 +456,7 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
             max_steps = min(training_args.position_lr_max_steps, training_args.fine_iterations)
-            #self.static_xyz_scheduler_args = get_linear_lr_func(lr_init=(training_args.static_position_lr_init-training_args.static_position_lr_final)/6 * self.spatial_lr_scale,
-            self.static_xyz_scheduler_args = get_linear_lr_func(lr_init=training_args.static_position_lr_final*self.spatial_lr_scale,
+            self.static_xyz_scheduler_args = get_linear_lr_func(lr_init=(training_args.static_position_lr_init-training_args.static_position_lr_final)/6 * self.spatial_lr_scale,
                                                     lr_final=training_args.static_position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=max_steps)
