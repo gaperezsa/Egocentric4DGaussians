@@ -17,7 +17,7 @@ ModelHiddenParams = dict(
     ssim_weight = 0.1,                     # SSIM loss (fine_coloring)
     plane_tv_weight = 0.0001,              # Space-time TV regularization
     # ========== Other Hyperparameters ==========
-    time_smoothness_weight = 0.1,
+    time_smoothness_weight = 0.5,
     l1_time_planes = 0.0001,
     render_process=True,
     aria_rotated = True  # Rotate visualizations 90° CW for ADT data (raw Aria orientation)
@@ -45,8 +45,8 @@ OptimizationParams = dict(
     
     # ========== Densification & Pruning Strategy ==========
     densify_from_iter = 500,
-    densification_interval = 200,
-    pruning_interval = 400,
+    densification_interval = 400,
+    pruning_interval = 300,
     densify_until_iter = 5_000,
     opacity_reset_interval = 2100,
     scale_pruning_factor = 1.0,
@@ -61,4 +61,7 @@ OptimizationParams = dict(
     # opacity_threshold_fine_after = 0.005,
     split_N = 2,              # Number of children per split 3 default
     split_scale_factor = 3 # Scale divisor: child = parent / factor (2.0 = 50% size, 2.4 = 42% size, 0.8*3=2.4 for 3 children)
+
+
+
 )

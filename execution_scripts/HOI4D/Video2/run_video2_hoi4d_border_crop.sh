@@ -22,11 +22,7 @@ conda activate Gaussians4D
 # ====================================================================
 python train_dynamic_depth.py \
   --batch_size 4 \
-  --background_depth_iterations 10400 \
-  --background_RGB_iterations 0 \
-  --dynamics_depth_iterations 4100 \
-  --dynamics_RGB_iterations 4100 \
-  --fine_iterations 10400 \
+  fine_opt_dyn_lr_downscaler = 1
   --normal_loss_weight 0.4 \
   --general_depth_weight 10.0 \
   --rgb_weight 80.0 \
