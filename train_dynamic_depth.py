@@ -571,7 +571,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
         
         # ------------------ STAGE: dynamics_depth ------------------
         elif stage == "dynamics_depth":
-            # Chamfer loss on dynamic point clouds
+            # Chamfer loss on dynamic point clouds (skip if weight is zero)
             dynamic_mask_loss = chamfer_loss(dynamic_point_cloud, gt_dynamic_point_cloud)
 
             # K-Planes temporal regulation: penalize temporal acceleration (XT/YT/ZT planes)
@@ -593,9 +593,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
             mask = (gt_dynamic_masks_tensor).unsqueeze(1).repeat(1, 3, 1, 1)
             Ll1 = l1_background_colored_masked_loss(dynamic_image_tensor, gt_image_tensor[:, :3, :, :], mask, background)
             
-            # Chamfer loss with median distance
+            # Chamfer loss with median distance (skip entirely if weight is zero)
             # VRAM optimization: if too many dynamic Gaussians, sample them for Chamfer computation
-            if len(dynamic_point_cloud) > 0:
+            if hyper.chamfer_weight > 0 and len(dynamic_point_cloud) > 0:
                 max_dynamic_for_chamfer = 5000  # Limit to avoid VRAM explosion
                 if dynamic_point_cloud[0].shape[0] > max_dynamic_for_chamfer:
                     # Randomly sample Gaussians for Chamfer loss
@@ -605,8 +605,6 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                     dynamic_point_cloud_sampled = dynamic_point_cloud
                 
                 dynamic_mask_loss = chamfer_loss(dynamic_point_cloud_sampled, gt_dynamic_point_cloud)
-            else:
-                dynamic_mask_loss = torch.tensor(0.0, device="cuda")
             
             # Depth loss: dynamic regions only (masked GT depth)
             dynamic_only_depth_image_tensor = torch.cat(dynamic_depth, 0)
@@ -1059,10 +1057,11 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 # prune
                 if iteration > opt.pruning_from_iter and iteration < opt.densify_until_iter and iteration < int(0.7 * final_iter) and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
                     # Prune using depth error blame scores (mean error = sum / count)
-                    if stage == "fine_coloring":
-                        depth_blame_percent = None
-                    else:
-                        depth_blame_percent = opt.depth_blame_percent
+                    # abal;tion of no DRP, must be uncommented later!
+                    #if stage == "fine_coloring":
+                    depth_blame_percent = None
+                    #else:
+                    #    depth_blame_percent = opt.depth_blame_percent
 
                     gaussians.prune(
                         opacity_threshold,
