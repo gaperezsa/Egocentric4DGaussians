@@ -26,3 +26,5 @@ debug_extrinsics.py
 gaussian_renderer/debug_removable_densification_visualizer.py
 output_best_baselines/
 visualization_utils/dynamic_pointclouds*
+
+.ipynb_checkpoints/

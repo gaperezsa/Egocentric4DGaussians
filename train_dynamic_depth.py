@@ -932,7 +932,9 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 
 
                 # Stage-specific Gaussian budgets:
-                max_gaussians = 2000000
+                # Dynamics/fine cap defaults to 2M; override via MAX_GAUSSIANS_DYNFINE
+                # (used to cap OOM-prone seqs like ADT clean to fit 44GB VRAM).
+                max_gaussians = int(os.environ.get("MAX_GAUSSIANS_DYNFINE", 2000000))
                 if stage in ("background_depth", "background_RGB"):
                     max_gaussians = 1000000
                 
@@ -1057,11 +1059,10 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                 # prune
                 if iteration > opt.pruning_from_iter and iteration < opt.densify_until_iter and iteration < int(0.7 * final_iter) and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>150000:
                     # Prune using depth error blame scores (mean error = sum / count)
-                    # abal;tion of no DRP, must be uncommented later!
-                    #if stage == "fine_coloring":
-                    depth_blame_percent = None
-                    #else:
-                    #    depth_blame_percent = opt.depth_blame_percent
+                    if stage == "fine_coloring":
+                        depth_blame_percent = None
+                    else:
+                        depth_blame_percent = opt.depth_blame_percent
 
                     gaussians.prune(
                         opacity_threshold,
@@ -1069,7 +1070,7 @@ def dynamic_depth_scene_reconstruction(dataset, opt, hyper, pipe, testing_iterat
                         max_screen_size = 0.5 * math.sqrt((viewpoint_cam.image_width**2) + (viewpoint_cam.image_height**2)),
                         depth_blame_percent = depth_blame_percent
                     )
-                    print(f"[ITER {iteration}] Pruned with depth blame percent: {opt.depth_blame_percent}")
+                    print(f"[ITER {iteration}] Pruned with depth blame percent: {depth_blame_percent}")
                     
                     # RESET depth error stats after pruning (start fresh for next pruning interval)
                     gaussians.reset_depth_error_stats()
